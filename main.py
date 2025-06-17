@@ -1,7 +1,9 @@
+import os
+os.environ['QT_OPENGL'] = 'software'
 import sys
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QPushButton, QFileDialog, QMessageBox, QStatusBar, QLabel,
-    QListWidget, QAbstractItemView, QHBoxLayout, QDialog, QPushButton, QSlider
+    QListWidget, QAbstractItemView, QHBoxLayout, QDialog, QPushButton, QSlider, QGridLayout
 )
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont
@@ -139,7 +141,7 @@ class GCodeEditor(QMainWindow):
 
     def save_gcode_file(self):
         if not self.gcode_file_path or self.cleaned_gcode is None:
-            QMessageBox.warning(self, "Warning", "No G-code
+            QMessageBox.warning(self, "Warning", "No G-code file loaded or cleaned G-code is missing.")
             return
         if not self.selected_layers:
             QMessageBox.warning(self, "Warning", "No layers selected for editing.")
@@ -198,11 +200,68 @@ class Layer3DViewerDialog(QDialog):
         self.setWindowState(self.windowState() | Qt.WindowMaximized)
         self.layer_lines = layer_lines
         self.moves = self.parse_moves(layer_lines)
+        self.edit_sessions = []  # List of dicts: {'origin_idx', 'current_idx', 'color', 'move_stack'}
+        self.session_colors = [
+            (1,0,0,1),      # Red
+            (1,0.5,0,1),    # Orange
+            (1,1,0,1),      # Yellow
+            (0,1,0,1),      # Green
+            (0,0,1,1),      # Blue
+            (0.5,0,1,1),    # Purple
+            (1,0,1,1),      # Magenta
+            (0,1,1,1),      # Cyan
+        ]
+        self.session_color_idx = 0
+        self.manual_origin_idx = None
+        self.manual_current_idx = None
+        self.manual_move_stack = []
+        self.editor_active = False
         self.current_index = len(self.moves) if self.moves else 0
         layout = QVBoxLayout(self)
         self.gl_widget = gl.GLViewWidget()
         self.gl_widget.setBackgroundColor('w')
         layout.addWidget(self.gl_widget, stretch=1)
+        # Add Toolpath Editor button and D-pad
+        self.editor_button = QPushButton("Enable Toolpath Editor")
+        self.editor_button.setFixedWidth(270)  # Even wider for text
+        self.editor_button.setFixedHeight(38)
+        self.editor_button.clicked.connect(self.toggle_editor)
+        # Place in a horizontal layout, right-aligned
+        top_bar = QHBoxLayout()
+        top_bar.addStretch(1)
+        top_bar.addWidget(self.editor_button)
+        layout.addLayout(top_bar)
+        # D-Pad controls (hidden by default)
+        self.dpad_widget = QWidget()
+        dpad_layout = QGridLayout()
+        dpad_layout.setContentsMargins(0,0,0,0)
+        dpad_layout.setSpacing(2)
+        self.dpad_buttons = {}
+        directions = {
+            (0,1): ("▲", "up"),
+            (0,2): ("↗", "up_right"),
+            (1,0): ("◀", "left"),
+            (1,1): ("●", None),
+            (1,2): ("▶", "right"),
+            (2,0): ("↙", "down_left"),
+            (2,1): ("▼", "down"),
+            (2,2): ("↘", "down_right"),
+            (0,0): ("↖", "up_left"),
+        }
+        for (row, col), (label, direction) in directions.items():
+            btn = QPushButton(label)
+            btn.setFixedSize(32,32)
+            if direction:
+                btn.clicked.connect(lambda checked, d=direction: self.move_extruder(d))
+            self.dpad_buttons[direction] = btn
+            dpad_layout.addWidget(btn, row, col)
+        self.dpad_widget.setLayout(dpad_layout)
+        self.dpad_widget.setVisible(False)
+        # Place D-pad in a horizontal layout, right-aligned
+        dpad_bar = QHBoxLayout()
+        dpad_bar.addStretch(1)
+        dpad_bar.addWidget(self.dpad_widget)
+        layout.addLayout(dpad_bar)
         slider_layout = QHBoxLayout()
         self.slider = QSlider(Qt.Horizontal)
         self.slider.setMinimum(1)
@@ -212,65 +271,110 @@ class Layer3DViewerDialog(QDialog):
         slider_layout.addWidget(self.slider)
         self.status_label = QLabel()
         slider_layout.addWidget(self.status_label)
+        self.add_slider_arrows(slider_layout)
         layout.addLayout(slider_layout)
         self.update_plot()
-    def parse_moves(self, lines):
-        moves = []
-        x = y = z = e = None
-        last_x = last_y = last_z = last_e = None
-        current_type = None
-        for line in lines:
-            line = line.strip()
-            if not line or line.startswith('M'):
-                continue
-            if line.startswith(';TYPE:External perimeter'):
-                current_type = 'external_perimeter'
-                continue
-            elif line.startswith(';TYPE:Perimeter'):
-                current_type = 'perimeter'
-                continue
-            elif line.startswith(';TYPE:Travel'):
-                current_type = 'travel'
-                continue
-            elif line.startswith(';TYPE:'):
-                current_type = None
-                continue
-            if line.startswith('G0') or line.startswith('G1') or line.startswith('G01'):
-                parts = line.split()
-                for part in parts:
-                    if part.startswith('X'):
-                        x = float(part[1:])
-                    elif part.startswith('Y'):
-                        y = float(part[1:])
-                    elif part.startswith('Z'):
-                        z = float(part[1:])
-                    elif part.startswith('E'):
-                        try:
-                            e = float(part[1:])
-                        except ValueError:
-                            pass
-                if x is not None and y is not None:
-                    moves.append({'x': x, 'y': y, 'z': z if z is not None else (last_z if last_z is not None else 0), 'e': e if e is not None else (last_e if last_e is not None else 0), 'type': current_type})
-                    last_x, last_y, last_z, last_e = x, y, z if z is not None else last_z, e if e is not None else last_e
-            elif line.startswith('G2') or line.startswith('G3'):
-                parts = line.split()
-                for part in parts:
-                    if part.startswith('X'):
-                        x = float(part[1:])
-                    elif part.startswith('Y'):
-                        y = float(part[1:])
-                    elif part.startswith('Z'):
-                        z = float(part[1:])
-                    elif part.startswith('E'):
-                        try:
-                            e = float(part[1:])
-                        except ValueError:
-                            pass
-                if x is not None and y is not None:
-                    moves.append({'x': x, 'y': y, 'z': z if z is not None else (last_z if last_z is not None else 0), 'e': e if e is not None else (last_e if last_e is not None else 0), 'type': current_type})
-                    last_x, last_y, last_z, last_e = x, y, z if z is not None else last_z, e if e is not None else last_e
-        print(f"Diagnostic: Parsed {len(moves)} moves from G-code.")
-        return moves
+
+    def move_extruder(self, direction):
+        if not self.dpad_widget.isVisible():
+            return
+        if not self.moves:
+            return
+        idx = self.slider.value()
+        dir_vectors = {
+            "up":      np.array([-2.0, 0]),
+            "down":    np.array([2.0, 0]),
+            "left":    np.array([0, -2.0]),
+            "right":   np.array([0, 2.0]),
+            "up_right":   np.array([-2.0, 2.0]) / 1.414,
+            "up_left":    np.array([-2.0, -2.0]) / 1.414,
+            "down_right": np.array([2.0, 2.0]) / 1.414,
+            "down_left":  np.array([2.0, -2.0]) / 1.414,
+        }
+        move_vec = dir_vectors[direction]
+        # Use the latest session
+        session = self.edit_sessions[-1]
+        # If moving back cancels last move, pop it
+        if session['move_stack']:
+            last_vec = session['move_stack'][-1]
+            if np.allclose(move_vec, -last_vec):
+                session['move_stack'].pop()
+                self.moves.pop(idx-1)
+                self.current_index -= 1
+                self.slider.setMaximum(len(self.moves))
+                self.slider.setValue(idx-1)
+                session['current_idx'] = self.slider.value()-1
+                if not session['move_stack']:
+                    session['origin_idx'] = None
+                    session['current_idx'] = None
+                self.manual_origin_idx = session['origin_idx']
+                self.manual_current_idx = session['current_idx']
+                self.manual_move_stack = session['move_stack']
+                self.update_plot()
+                return
+        # Otherwise, add new move
+        last_move = self.moves[idx-1].copy()
+        last_move['x'] += move_vec[0]
+        last_move['y'] += move_vec[1]
+        last_move['type'] = 'travel'
+        self.moves.insert(idx, last_move)
+        session['move_stack'].append(move_vec)
+        session['current_idx'] = idx
+        self.manual_origin_idx = session['origin_idx']
+        self.manual_current_idx = session['current_idx']
+        self.manual_move_stack = session['move_stack']
+        self.current_index += 1
+        self.slider.setMaximum(len(self.moves))
+        self.slider.setValue(idx+1)
+        # If back at origin, reset indices and stack for this session
+        origin = np.array([
+            self.moves[session['origin_idx']]['x'],
+            self.moves[session['origin_idx']]['y'],
+            self.moves[session['origin_idx']]['z']
+        ])
+        current = np.array([
+            last_move['x'], last_move['y'], last_move['z']
+        ])
+        if np.allclose(origin, current):
+            session['origin_idx'] = None
+            session['current_idx'] = None
+            session['move_stack'] = []
+            self.manual_origin_idx = None
+            self.manual_current_idx = None
+            self.manual_move_stack = []
+        self.update_plot()
+
+    def toggle_editor(self):
+        if not self.dpad_widget.isVisible():
+            self.dpad_widget.setVisible(True)
+            self.editor_button.setText("Stop Editing")
+            self.editor_button.setStyleSheet("background-color: red; color: white;")
+            self.editor_active = True
+            # Start a new edit session with a fixed color and its own origin
+            idx = self.slider.value()-1
+            color = self.session_colors[len(self.edit_sessions) % len(self.session_colors)]
+            # The session's origin is the current extruder position (not connected to previous session)
+            self.manual_origin_idx = idx
+            self.manual_current_idx = idx
+            self.manual_move_stack = []
+            self.edit_sessions.append({
+                'origin_idx': idx,
+                'current_idx': idx,
+                'color': color,
+                'move_stack': [],
+                'origin_coords': np.array([
+                    self.moves[idx]['x'],
+                    self.moves[idx]['y'],
+                    self.moves[idx]['z']
+                ])
+            })
+        else:
+            self.dpad_widget.setVisible(False)
+            self.editor_button.setText("Enable Toolpath Editor")
+            self.editor_button.setStyleSheet("")
+            self.editor_active = False
+            self.end_editing_and_patch_path()
+        self.update_plot()
 
     def update_plot(self):
         self.gl_widget.clear()
@@ -289,23 +393,55 @@ class Layer3DViewerDialog(QDialog):
         for i in range(1, idx):
             seg = np.array([pts[i-1], pts[i]])
             move_type = self.moves[i]['type']
-            color = (0,0,1,1)  # Default: blue (perimeter)
+            # Default: gray for unspecified
+            color = (0.5,0.5,0.5,1)
             width = 3
             antialias = True
             if move_type == 'external_perimeter':
                 color = (0.5,0,0.5,1)  # Purple
+            elif move_type == 'perimeter':
+                color = (0,0,1,1)  # Blue
             elif move_type == 'travel':
                 color = (0,1,0,1)  # Green
                 width = 2
                 antialias = False
+                # Dotted line: use many short segments
+                dots = np.linspace(0, 1, 10)
+                for j in range(0, len(dots)-1, 2):
+                    dot_seg = np.vstack([
+                        seg[0] + (seg[1] - seg[0]) * dots[j],
+                        seg[0] + (seg[1] - seg[0]) * dots[j+1]
+                    ])
+                    dot_line = gl.GLLinePlotItem(pos=dot_seg, color=color, width=width, antialias=antialias, mode='lines')
+                    dot_line.setGLOptions('translucent')
+                    self.gl_widget.addItem(dot_line)
+                continue  # Skip normal line for travel
             plt = gl.GLLinePlotItem(pos=seg, color=color, width=width, antialias=antialias, mode='lines')
-            if move_type == 'travel':
-                plt.setGLOptions('translucent')
             self.gl_widget.addItem(plt)
-        # Draw extruder position as a large opaque red dot (above lines)
+        # Draw all edit session net moves as colored lines (only if editor is active)
+        if self.editor_active:
+            for session in self.edit_sessions:
+                # Only draw if session has a net move
+                if session['origin_idx'] is not None and session['current_idx'] is not None:
+                    # Only draw if both indices are within the current slider range
+                    if session['origin_idx'] < len(self.moves) and session['current_idx'] < len(self.moves):
+                        origin = session['origin_coords']
+                        current = np.array([
+                            self.moves[session['current_idx']]['x'],
+                            self.moves[session['current_idx']]['y'],
+                            self.moves[session['current_idx']]['z']
+                        ])
+                        if not np.allclose(origin, current):
+                            seg = np.array([origin, current])
+                            color = session['color']
+                            line = gl.GLLinePlotItem(pos=seg, color=color, width=7, antialias=True, mode='lines')
+                            self.gl_widget.addItem(line)
+        # Draw extruder position as a smaller opaque red sphere (above lines)
         last = pts[idx-1]
-        scatter = gl.GLScatterPlotItem(pos=np.array([last]), color=(1,0,0,1), size=40, pxMode=True)
-        self.gl_widget.addItem(scatter)
+        md = gl.MeshData.sphere(rows=20, cols=20, radius=0.625)
+        sphere = gl.GLMeshItem(meshdata=md, color=(1,0,0,1), smooth=True, shader='shaded', drawEdges=False)
+        sphere.translate(last[0], last[1], last[2])
+        self.gl_widget.addItem(sphere)
         self.status_label.setText(f"Showing {idx} moves / {len(self.moves)}")
         # Set camera to fit the data
         x_range = np.ptp(pts[:,0])
@@ -315,6 +451,122 @@ class Layer3DViewerDialog(QDialog):
         center = pg.Vector(center_coords[0], center_coords[1], center_coords[2])
         self.gl_widget.setCameraPosition(pos=center, distance=max_range, elevation=90, azimuth=0)
         self.gl_widget.setBackgroundColor('w')
+
+    def end_editing_and_patch_path(self):
+        # Called when editing is stopped, patch path if needed
+        if self.manual_current_idx is not None and self.manual_current_idx+1 < len(self.moves):
+            curr = self.moves[self.manual_current_idx]
+            next_move = self.moves[self.manual_current_idx+1]
+            # If next move is not at current position, insert a travel move from current to next (not to origin)
+            if not (np.isclose(curr['x'], next_move['x']) and np.isclose(curr['y'], next_move['y']) and np.isclose(curr['z'], next_move['z'])):
+                patched = curr.copy()
+                patched['x'] = next_move['x']
+                patched['y'] = next_move['y']
+                patched['z'] = next_move['z']
+                patched['type'] = 'travel'
+                self.moves.insert(self.manual_current_idx+1, patched)
+                self.current_index += 1
+                self.slider.setMaximum(len(self.moves))
+        # Reset manual indices and stack for next session
+        self.manual_origin_idx = None
+        self.manual_current_idx = None
+        self.manual_move_stack = []
+
+    def add_slider_arrows(self, layout):
+        arrow_back = QPushButton('◀')
+        arrow_back.setFixedWidth(32)
+        arrow_forward = QPushButton('▶')
+        arrow_forward.setFixedWidth(32)
+        arrow_back.clicked.connect(self.slider_back)
+        arrow_forward.clicked.connect(self.slider_forward)
+        layout.insertWidget(0, arrow_back)
+        layout.addWidget(arrow_forward)
+        self.arrow_back = arrow_back
+        self.arrow_forward = arrow_forward
+
+    def slider_back(self):
+        val = self.slider.value()
+        if val > self.slider.minimum():
+            self.slider.setValue(val-1)
+
+    def slider_forward(self):
+        val = self.slider.value()
+        if val < self.slider.maximum():
+            self.slider.setValue(val+1)
+
+    def parse_moves(self, lines):
+        moves = []
+        x = y = z = e = None
+        last_x = last_y = last_z = last_e = None
+        current_type = None
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith('M'):
+                continue
+            if line.startswith(';TYPE:External perimeter'):
+                current_type = 'external_perimeter'
+                continue
+            elif line.startswith(';TYPE:Perimeter'):
+                current_type = 'perimeter'
+                continue
+            elif line.startswith(';TYPE:'):
+                current_type = None
+                continue
+            if line.startswith('G0') or line.startswith('G1') or line.startswith('G01'):
+                parts = line.split()
+                for part in parts:
+                    if part.startswith('X'):
+                        x = float(part[1:])
+                    elif part.startswith('Y'):
+                        y = float(part[1:])
+                    elif part.startswith('Z'):
+                        z = float(part[1:])
+                    elif part.startswith('E'):
+                        try:
+                            e = float(part[1:])
+                        except ValueError:
+                            pass
+                is_travel = False
+                if last_e is not None and (e is None or e == last_e):
+                    is_travel = True
+                if x is not None and y is not None:
+                    moves.append({'x': x, 'y': y, 'z': z if z is not None else (last_z if last_z is not None else 0),
+                                  'e': e if e is not None else (last_e if last_e is not None else 0),
+                                  'type': 'travel' if is_travel else current_type})
+                    last_x, last_y, last_z, last_e = x, y, z if z is not None else last_z, e if e is not None else last_e
+            elif line.startswith('G2') or line.startswith('G3'):
+                parts = line.split()
+                for part in parts:
+                    if part.startswith('X'):
+                        x = float(part[1:])
+                    elif part.startswith('Y'):
+                        y = float(part[1:])
+                    elif part.startswith('Z'):
+                        z = float(part[1:])
+                    elif part.startswith('E'):
+                        try:
+                            e = float(part[1:])
+                        except ValueError:
+                            pass
+                is_travel = False
+                if last_e is not None and (e is None or e == last_e):
+                    is_travel = True
+                if x is not None and y is not None:
+                    moves.append({'x': x, 'y': y, 'z': z if z is not None else (last_z if last_z is not None else 0),
+                                  'e': e if e is not None else (last_e if last_e is not None else 0),
+                                  'type': 'travel' if is_travel else current_type})
+                    last_x, last_y, last_z, last_e = x, y, z if z is not None else last_z, e if e is not None else last_e
+        return moves
+
+    def closeEvent(self, event):
+        # Explicitly delete GL items and widget to avoid OpenGL context errors
+        try:
+            self.gl_widget.clear()
+            self.gl_widget.setParent(None)
+            self.gl_widget.deleteLater()
+        except Exception:
+            pass
+        event.accept()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
