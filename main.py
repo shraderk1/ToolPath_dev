@@ -1,5 +1,3 @@
-import os
-os.environ['QT_OPENGL'] = 'software'
 import sys
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QPushButton, QFileDialog, QMessageBox, QStatusBar, QLabel,
@@ -200,7 +198,7 @@ class Layer3DViewerDialog(QDialog):
         self.setWindowState(self.windowState() | Qt.WindowMaximized)
         self.layer_lines = layer_lines
         self.moves = self.parse_moves(layer_lines)
-        self.edit_sessions = []  # List of dicts: {'origin_idx', 'current_idx', 'color', 'move_stack'}
+        self.edit_sessions = []  # List of dicts: {'origin_idx', 'current_idx', 'color', 'move_stack', 'origin_coords'}
         self.session_colors = [
             (1,0,0,1),      # Red
             (1,0.5,0,1),    # Orange
@@ -352,8 +350,8 @@ class Layer3DViewerDialog(QDialog):
             self.editor_active = True
             # Start a new edit session with a fixed color and its own origin
             idx = self.slider.value()-1
+            # Assign color based on the number of sessions already created (fixed per session)
             color = self.session_colors[len(self.edit_sessions) % len(self.session_colors)]
-            # The session's origin is the current extruder position (not connected to previous session)
             self.manual_origin_idx = idx
             self.manual_current_idx = idx
             self.manual_move_stack = []
@@ -436,12 +434,28 @@ class Layer3DViewerDialog(QDialog):
                             color = session['color']
                             line = gl.GLLinePlotItem(pos=seg, color=color, width=7, antialias=True, mode='lines')
                             self.gl_widget.addItem(line)
-        # Draw extruder position as a smaller opaque red sphere (above lines)
+        # Draw extruder position: use sphere for first open, square for subsequent opens
         last = pts[idx-1]
-        md = gl.MeshData.sphere(rows=20, cols=20, radius=0.625)
-        sphere = gl.GLMeshItem(meshdata=md, color=(1,0,0,1), smooth=True, shader='shaded', drawEdges=False)
-        sphere.translate(last[0], last[1], last[2])
-        self.gl_widget.addItem(sphere)
+        if not hasattr(self, '_viewer_open_count'):
+            self._viewer_open_count = 0
+        self._viewer_open_count += 1
+        if self._viewer_open_count == 1:
+            # First open: use 3D sphere
+            try:
+                md = gl.MeshData.sphere(rows=20, cols=20, radius=0.625)
+                sphere = gl.GLMeshItem(meshdata=md, color=(1,0,0,1), smooth=True, shader='shaded', drawEdges=False)
+                sphere.translate(last[0], last[1], last[2])
+                sphere.setGLOptions('opaque')
+                self.gl_widget.addItem(sphere)
+            except Exception as e:
+                scatter = gl.GLScatterPlotItem(pos=np.array([last]), color=(1,0,0,1), size=20, pxMode=True)
+                scatter.setGLOptions('opaque')
+                self.gl_widget.addItem(scatter)
+        else:
+            # Subsequent opens: use square scatterplot
+            scatter = gl.GLScatterPlotItem(pos=np.array([last]), color=(1,0,0,1), size=20, pxMode=True)
+            scatter.setGLOptions('opaque')
+            self.gl_widget.addItem(scatter)
         self.status_label.setText(f"Showing {idx} moves / {len(self.moves)}")
         # Set camera to fit the data
         x_range = np.ptp(pts[:,0])
@@ -559,7 +573,7 @@ class Layer3DViewerDialog(QDialog):
         return moves
 
     def closeEvent(self, event):
-        # Explicitly delete GL items and widget to avoid OpenGL context errors
+        # Explicitly clear and delete GLViewWidget to avoid OpenGL context errors
         try:
             self.gl_widget.clear()
             self.gl_widget.setParent(None)
