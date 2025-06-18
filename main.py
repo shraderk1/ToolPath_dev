@@ -10,6 +10,8 @@ import pyqtgraph.opengl as gl
 import pyqtgraph as pg
 import numpy as np
 
+viewer_open_count = 0
+
 class GCodeEditor(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -20,6 +22,8 @@ class GCodeEditor(QMainWindow):
         self.layer_indices = []
         self.layer_labels = []
         self.selected_layers = set()
+        self.viewer_dialog = None  # Persistent 3D viewer dialog
+        self.layer_edits = {}  # Store edits per layer index
         self.init_ui()
 
     def init_ui(self):
@@ -137,6 +141,34 @@ class GCodeEditor(QMainWindow):
                 cleaned.append(line)
         return cleaned
 
+    def moves_to_gcode(self, moves):
+        # Convert moves (list of dicts) back to G-code lines
+        gcode_lines = []
+        last_e = None
+        for m in moves:
+            x = f"X{m['x']:.3f}" if 'x' in m and m['x'] is not None else ''
+            y = f"Y{m['y']:.3f}" if 'y' in m and m['y'] is not None else ''
+            z = f"Z{m['z']:.3f}" if 'z' in m and m['z'] is not None else ''
+            e = f"E{m['e']:.5f}" if 'e' in m and m['e'] is not None else ''
+            # Only include E if it changes
+            if last_e is not None and e and float(e[1:]) == last_e:
+                e = ''
+            if m['type'] == 'external_perimeter':
+                gcode_lines.append(';TYPE:External perimeter\n')
+            elif m['type'] == 'perimeter':
+                gcode_lines.append(';TYPE:Perimeter\n')
+            elif m['type'] is None:
+                pass
+            # Always use G1 for edited moves
+            gline = f"G1 {x} {y} {z} {e}".strip() + '\n'
+            gcode_lines.append(gline)
+            if e:
+                try:
+                    last_e = float(e[1:])
+                except Exception:
+                    pass
+        return gcode_lines
+
     def save_gcode_file(self):
         if not self.gcode_file_path or self.cleaned_gcode is None:
             QMessageBox.warning(self, "Warning", "No G-code file loaded or cleaned G-code is missing.")
@@ -147,9 +179,20 @@ class GCodeEditor(QMainWindow):
         file_path, _ = QFileDialog.getSaveFileName(self, "Save G-code File As", "", "G-code Files (*.gcode *.nc *.txt);;All Files (*)")
         if file_path:
             try:
+                # Build new G-code with edits, preserving all original lines except for edited layers
+                new_gcode = []
+                layer_ptrs = self.layer_indices + [len(self.cleaned_gcode)]
+                for i, (start, end) in enumerate(zip(layer_ptrs[:-1], layer_ptrs[1:])):
+                    if i in self.layer_edits:
+                        # Only replace this layer's lines with edited moves
+                        new_gcode.extend(self.moves_to_gcode(self.layer_edits[i]))
+                    else:
+                        # Copy original lines for this layer exactly
+                        new_gcode.extend(self.cleaned_gcode[start:end])
                 with open(file_path, 'w') as file:
-                    file.writelines(self.cleaned_gcode)
+                    file.writelines(new_gcode)
                 self.status_bar.showMessage(f"Saved: {file_path}")
+                QMessageBox.information(self, "Saved", f"G-code saved to {file_path}")
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to save file: {e}")
         else:
@@ -163,8 +206,17 @@ class GCodeEditor(QMainWindow):
         start = self.layer_indices[idx]
         end = self.layer_indices[idx+1] if idx+1 < len(self.layer_indices) else len(self.cleaned_gcode)
         layer_lines = self.cleaned_gcode[start:end]
-        dlg = Layer3DViewerDialog(layer_lines, self)
-        dlg.exec_()
+        moves_override = self.layer_edits.get(idx, None)
+        if self.viewer_dialog is None:
+            self.viewer_dialog = Layer3DViewerDialog(layer_lines, mainwin=self, layer_idx=idx, moves_override=moves_override)
+        else:
+            self.viewer_dialog.set_layer(layer_lines, layer_idx=idx, moves_override=moves_override)
+        self.viewer_dialog.show()
+        self.viewer_dialog.raise_()
+        self.viewer_dialog.activateWindow()
+
+    def save_layer_edits(self, layer_idx, moves):
+        self.layer_edits[layer_idx] = moves
 
 class LayerSelectorDialog(QDialog):
     def __init__(self, layer_labels, selected_layers, parent=None):
@@ -191,8 +243,92 @@ class LayerSelectorDialog(QDialog):
         return set([i.row() for i in self.list_widget.selectedIndexes()])
 
 class Layer3DViewerDialog(QDialog):
-    def __init__(self, layer_lines, parent=None):
+    def save_edits(self):
+        # Quality check popup before saving
+        reply = QMessageBox.question(self, "Confirm Save", "Are you sure you want to save your edits for this layer?", QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            if self.mainwin and hasattr(self.mainwin, 'save_layer_edits') and self.layer_idx is not None and self.layer_idx >= 0:
+                self.mainwin.save_layer_edits(self.layer_idx, self.moves)
+                QMessageBox.information(self, "Edits Saved", f"Edits for layer {self.layer_idx} saved in viewer.")
+            else:
+                QMessageBox.warning(self, "Save Failed", "Could not find main window or valid layer index to save edits.")
+        else:
+            QMessageBox.information(self, "Save Cancelled", "Edits were not saved.")
+
+    def parse_moves(self, lines):
+        moves = []
+        x = y = z = e = None
+        last_x = last_y = last_z = last_e = None
+        current_type = None
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith('M'):
+                continue
+            if line.startswith(';TYPE:External perimeter'):
+                current_type = 'external_perimeter'
+                continue
+            elif line.startswith(';TYPE:Perimeter'):
+                current_type = 'perimeter'
+                continue
+            elif line.startswith(';TYPE:'):
+                current_type = None
+                continue
+            if line.startswith('G0') or line.startswith('G1') or line.startswith('G01'):
+                parts = line.split()
+                for part in parts:
+                    if part.startswith('X'):
+                        x = float(part[1:])
+                    elif part.startswith('Y'):
+                        y = float(part[1:])
+                    elif part.startswith('Z'):
+                        z = float(part[1:])
+                    elif part.startswith('E'):
+                        try:
+                            e = float(part[1:])
+                        except ValueError:
+                            pass
+                is_travel = False
+                if last_e is not None and (e is None or e == last_e):
+                    is_travel = True
+                if x is not None and y is not None:
+                    moves.append({'x': x, 'y': y, 'z': z if z is not None else (last_z if last_z is not None else 0),
+                                  'e': e if e is not None else (last_e if last_e is not None else 0),
+                                  'type': 'travel' if is_travel else current_type})
+                    last_x, last_y, last_z, last_e = x, y, z if z is not None else last_z, e if e is not None else last_e
+            elif line.startswith('G2') or line.startswith('G3'):
+                parts = line.split()
+                for part in parts:
+                    if part.startswith('X'):
+                        x = float(part[1:])
+                    elif part.startswith('Y'):
+                        y = float(part[1:])
+                    elif part.startswith('Z'):
+                        z = float(part[1:])
+                    elif part.startswith('E'):
+                        try:
+                            e = float(part[1:])
+                        except ValueError:
+                            pass
+                is_travel = False
+                if last_e is not None and (e is None or e == last_e):
+                    is_travel = True
+                if x is not None and y is not None:
+                    moves.append({'x': x, 'y': y, 'z': z if z is not None else (last_z if last_z is not None else 0),
+                                  'e': e if e is not None else (last_e if last_e is not None else 0),
+                                  'type': 'travel' if is_travel else current_type})
+                    last_x, last_y, last_z, last_e = x, y, z if z is not None else last_z, e if e is not None else last_e
+        return moves
+
+    def __init__(self, layer_lines, parent=None, mainwin=None, layer_idx=None, moves_override=None):
         super().__init__(parent)
+        self.mainwin = mainwin
+        self.layer_idx = layer_idx if layer_idx is not None else -1
+        global viewer_open_count
+        viewer_open_count += 1
+        if viewer_open_count == 1:
+            self.extruder_head_style = 'sphere'
+        else:
+            self.extruder_head_style = 'square'
         self.setWindowTitle("3D Layer Viewer")
         self.setMinimumSize(900, 700)
         self.setWindowState(self.windowState() | Qt.WindowMaximized)
@@ -272,6 +408,28 @@ class Layer3DViewerDialog(QDialog):
         self.add_slider_arrows(slider_layout)
         layout.addLayout(slider_layout)
         self.update_plot()
+        # Widen Minimize/Maximize and Save Edits buttons
+        self.minmax_button = QPushButton("Minimize/Maximize")
+        self.minmax_button.setFixedWidth(220)
+        self.minmax_button.clicked.connect(self.toggle_minmax)
+        minmax_bar = QHBoxLayout()
+        minmax_bar.addStretch(1)
+        minmax_bar.addWidget(self.minmax_button)
+        layout.insertLayout(0, minmax_bar)
+        self.save_edits_button = QPushButton("Save Edits (in viewer)")
+        self.save_edits_button.setFixedWidth(260)
+        self.save_edits_button.clicked.connect(self.save_edits)
+        save_bar = QHBoxLayout()
+        save_bar.addStretch(1)
+        save_bar.addWidget(self.save_edits_button)
+        layout.insertLayout(1, save_bar)
+        # Set initial state to minimized (25%) and initialize toggle state
+        screen = QApplication.primaryScreen().availableGeometry()
+        w, h = int(screen.width()*0.25), int(screen.height()*0.25)
+        self.resize(w, h)
+        self.move((screen.width()-w)//2, (screen.height()-h)//2)
+        self._is_custom_maximized = False
+        self._has_been_shown = False
 
     def move_extruder(self, direction):
         if not self.dpad_widget.isVisible():
@@ -290,17 +448,16 @@ class Layer3DViewerDialog(QDialog):
             "down_left":  np.array([2.0, -2.0]) / 1.414,
         }
         move_vec = dir_vectors[direction]
-        # Use the latest session
         session = self.edit_sessions[-1]
         # If moving back cancels last move, pop it
         if session['move_stack']:
             last_vec = session['move_stack'][-1]
             if np.allclose(move_vec, -last_vec):
-                session['move_stack'].pop()
                 self.moves.pop(idx-1)
                 self.current_index -= 1
                 self.slider.setMaximum(len(self.moves))
                 self.slider.setValue(idx-1)
+                session['move_stack'].pop()
                 session['current_idx'] = self.slider.value()-1
                 if not session['move_stack']:
                     session['origin_idx'] = None
@@ -310,12 +467,22 @@ class Layer3DViewerDialog(QDialog):
                 self.manual_move_stack = session['move_stack']
                 self.update_plot()
                 return
-        # Otherwise, add new move
+        # Otherwise, add new lifted travel move (sloped, no drop)
         last_move = self.moves[idx-1].copy()
-        last_move['x'] += move_vec[0]
-        last_move['y'] += move_vec[1]
-        last_move['type'] = 'travel'
-        self.moves.insert(idx, last_move)
+        orig_x, orig_y, orig_z = last_move['x'], last_move['y'], last_move['z']
+        dx, dy = move_vec[0], move_vec[1]
+        lift_height = 1.5
+        xy_dist = np.linalg.norm([dx, dy])
+        slope_angle_rad = np.deg2rad(30)
+        slope_dz = np.tan(slope_angle_rad) * xy_dist
+        actual_lift = min(lift_height, slope_dz)
+        # Move in XY and Z (sloped lift)
+        lifted_move = last_move.copy()
+        lifted_move['x'] += dx
+        lifted_move['y'] += dy
+        lifted_move['z'] = orig_z + actual_lift
+        lifted_move['type'] = 'travel'
+        self.moves.insert(idx, lifted_move)
         session['move_stack'].append(move_vec)
         session['current_idx'] = idx
         self.manual_origin_idx = session['origin_idx']
@@ -331,7 +498,7 @@ class Layer3DViewerDialog(QDialog):
             self.moves[session['origin_idx']]['z']
         ])
         current = np.array([
-            last_move['x'], last_move['y'], last_move['z']
+            lifted_move['x'], lifted_move['y'], lifted_move['z']
         ])
         if np.allclose(origin, current):
             session['origin_idx'] = None
@@ -371,7 +538,7 @@ class Layer3DViewerDialog(QDialog):
             self.editor_button.setText("Enable Toolpath Editor")
             self.editor_button.setStyleSheet("")
             self.editor_active = False
-            self.end_editing_and_patch_path()
+            #self.end_editing_and_patch_path()
         self.update_plot()
 
     def update_plot(self):
@@ -436,11 +603,7 @@ class Layer3DViewerDialog(QDialog):
                             self.gl_widget.addItem(line)
         # Draw extruder position: use sphere for first open, square for subsequent opens
         last = pts[idx-1]
-        if not hasattr(self, '_viewer_open_count'):
-            self._viewer_open_count = 0
-        self._viewer_open_count += 1
-        if self._viewer_open_count == 1:
-            # First open: use 3D sphere
+        if self.extruder_head_style == 'sphere':
             try:
                 md = gl.MeshData.sphere(rows=20, cols=20, radius=0.625)
                 sphere = gl.GLMeshItem(meshdata=md, color=(1,0,0,1), smooth=True, shader='shaded', drawEdges=False)
@@ -452,7 +615,6 @@ class Layer3DViewerDialog(QDialog):
                 scatter.setGLOptions('opaque')
                 self.gl_widget.addItem(scatter)
         else:
-            # Subsequent opens: use square scatterplot
             scatter = gl.GLScatterPlotItem(pos=np.array([last]), color=(1,0,0,1), size=20, pxMode=True)
             scatter.setGLOptions('opaque')
             self.gl_widget.addItem(scatter)
@@ -465,26 +627,6 @@ class Layer3DViewerDialog(QDialog):
         center = pg.Vector(center_coords[0], center_coords[1], center_coords[2])
         self.gl_widget.setCameraPosition(pos=center, distance=max_range, elevation=90, azimuth=0)
         self.gl_widget.setBackgroundColor('w')
-
-    def end_editing_and_patch_path(self):
-        # Called when editing is stopped, patch path if needed
-        if self.manual_current_idx is not None and self.manual_current_idx+1 < len(self.moves):
-            curr = self.moves[self.manual_current_idx]
-            next_move = self.moves[self.manual_current_idx+1]
-            # If next move is not at current position, insert a travel move from current to next (not to origin)
-            if not (np.isclose(curr['x'], next_move['x']) and np.isclose(curr['y'], next_move['y']) and np.isclose(curr['z'], next_move['z'])):
-                patched = curr.copy()
-                patched['x'] = next_move['x']
-                patched['y'] = next_move['y']
-                patched['z'] = next_move['z']
-                patched['type'] = 'travel'
-                self.moves.insert(self.manual_current_idx+1, patched)
-                self.current_index += 1
-                self.slider.setMaximum(len(self.moves))
-        # Reset manual indices and stack for next session
-        self.manual_origin_idx = None
-        self.manual_current_idx = None
-        self.manual_move_stack = []
 
     def add_slider_arrows(self, layout):
         arrow_back = QPushButton('◀')
@@ -508,79 +650,58 @@ class Layer3DViewerDialog(QDialog):
         if val < self.slider.maximum():
             self.slider.setValue(val+1)
 
-    def parse_moves(self, lines):
-        moves = []
-        x = y = z = e = None
-        last_x = last_y = last_z = last_e = None
-        current_type = None
-        for line in lines:
-            line = line.strip()
-            if not line or line.startswith('M'):
-                continue
-            if line.startswith(';TYPE:External perimeter'):
-                current_type = 'external_perimeter'
-                continue
-            elif line.startswith(';TYPE:Perimeter'):
-                current_type = 'perimeter'
-                continue
-            elif line.startswith(';TYPE:'):
-                current_type = None
-                continue
-            if line.startswith('G0') or line.startswith('G1') or line.startswith('G01'):
-                parts = line.split()
-                for part in parts:
-                    if part.startswith('X'):
-                        x = float(part[1:])
-                    elif part.startswith('Y'):
-                        y = float(part[1:])
-                    elif part.startswith('Z'):
-                        z = float(part[1:])
-                    elif part.startswith('E'):
-                        try:
-                            e = float(part[1:])
-                        except ValueError:
-                            pass
-                is_travel = False
-                if last_e is not None and (e is None or e == last_e):
-                    is_travel = True
-                if x is not None and y is not None:
-                    moves.append({'x': x, 'y': y, 'z': z if z is not None else (last_z if last_z is not None else 0),
-                                  'e': e if e is not None else (last_e if last_e is not None else 0),
-                                  'type': 'travel' if is_travel else current_type})
-                    last_x, last_y, last_z, last_e = x, y, z if z is not None else last_z, e if e is not None else last_e
-            elif line.startswith('G2') or line.startswith('G3'):
-                parts = line.split()
-                for part in parts:
-                    if part.startswith('X'):
-                        x = float(part[1:])
-                    elif part.startswith('Y'):
-                        y = float(part[1:])
-                    elif part.startswith('Z'):
-                        z = float(part[1:])
-                    elif part.startswith('E'):
-                        try:
-                            e = float(part[1:])
-                        except ValueError:
-                            pass
-                is_travel = False
-                if last_e is not None and (e is None or e == last_e):
-                    is_travel = True
-                if x is not None and y is not None:
-                    moves.append({'x': x, 'y': y, 'z': z if z is not None else (last_z if last_z is not None else 0),
-                                  'e': e if e is not None else (last_e if last_e is not None else 0),
-                                  'type': 'travel' if is_travel else current_type})
-                    last_x, last_y, last_z, last_e = x, y, z if z is not None else last_z, e if e is not None else last_e
-        return moves
+    def set_layer(self, layer_lines, layer_idx=None, moves_override=None):
+        self.layer_lines = layer_lines
+        if layer_idx is not None:
+            self.layer_idx = layer_idx
+        elif not hasattr(self, 'layer_idx'):
+            self.layer_idx = -1
+        if moves_override is not None:
+            self.moves = [dict(m) for m in moves_override]
+        else:
+            self.moves = self.parse_moves(layer_lines)
+        self.current_index = len(self.moves) if self.moves else 0
+        self.slider.setMaximum(len(self.moves) if self.moves else 1)
+        self.slider.setValue(self.current_index)
+        self.edit_sessions = []
+        self.manual_origin_idx = None
+        self.manual_current_idx = None
+        self.manual_move_stack = []
+        self.session_color_idx = 0
+        self.update_plot()
+
+    def showEvent(self, event):
+        # Always minimize to 25% the first time the dialog is shown and set state
+        if not hasattr(self, '_has_been_shown') or not self._has_been_shown:
+            screen = QApplication.primaryScreen().availableGeometry()
+            w_min, h_min = int(screen.width()*0.25), int(screen.height()*0.25)
+            self.resize(w_min, h_min)
+            self.move((screen.width()-w_min)//2, (screen.height()-h_min)//2)
+            self._is_custom_maximized = False
+            self._has_been_shown = True
+        super().showEvent(event)
+
+    def toggle_minmax(self):
+        screen = QApplication.primaryScreen().availableGeometry()
+        w_min, h_min = int(screen.width()*0.25), int(screen.height()*0.25)
+        w_max, h_max = int(screen.width()*0.95), int(screen.height()*0.95)
+        cur_w, cur_h = self.width(), self.height()
+        # Decide based on current size, not just state variable
+        if abs(cur_w - w_min) < abs(cur_w - w_max):
+            # Currently minimized, so maximize
+            self.resize(w_max, h_max)
+            self.move((screen.width()-w_max)//2, (screen.height()-h_max)//2)
+            self._is_custom_maximized = True
+        else:
+            # Currently maximized or other, so minimize
+            self.resize(w_min, h_min)
+            self.move((screen.width()-w_min)//2, (screen.height()-h_min)//2)
+            self._is_custom_maximized = False
 
     def closeEvent(self, event):
-        # Explicitly clear and delete GLViewWidget to avoid OpenGL context errors
-        try:
-            self.gl_widget.clear()
-            self.gl_widget.setParent(None)
-            self.gl_widget.deleteLater()
-        except Exception:
-            pass
-        event.accept()
+        # Hide instead of destroy, to persist OpenGL context
+        self.hide()
+        event.ignore()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
