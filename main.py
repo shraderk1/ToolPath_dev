@@ -179,15 +179,22 @@ class GCodeEditor(QMainWindow):
         file_path, _ = QFileDialog.getSaveFileName(self, "Save G-code File As", "", "G-code Files (*.gcode *.nc *.txt);;All Files (*)")
         if file_path:
             try:
-                # Build new G-code with edits, preserving all original lines except for edited layers
+                # Build new G-code with edits, inserting at correct positions
                 new_gcode = []
                 layer_ptrs = self.layer_indices + [len(self.cleaned_gcode)]
                 for i, (start, end) in enumerate(zip(layer_ptrs[:-1], layer_ptrs[1:])):
                     if i in self.layer_edits:
-                        # Only replace this layer's lines with edited moves
-                        new_gcode.extend(self.moves_to_gcode(self.layer_edits[i]))
+                        # Get original lines for this layer
+                        orig_lines = list(self.cleaned_gcode[start:end])
+                        # Get list of (insert_idx, new_moves) for this layer
+                        edits = self.layer_edits[i]  # Should be a list of (insert_idx, moves) tuples
+                        # Sort edits by insert_idx descending so insertion doesn't affect subsequent indices
+                        edits_sorted = sorted(edits, key=lambda x: x[0], reverse=True)
+                        for insert_idx, moves in edits_sorted:
+                            gcode_moves = self.moves_to_gcode(moves)
+                            orig_lines[insert_idx:insert_idx] = gcode_moves
+                        new_gcode.extend(orig_lines)
                     else:
-                        # Copy original lines for this layer exactly
                         new_gcode.extend(self.cleaned_gcode[start:end])
                 with open(file_path, 'w') as file:
                     file.writelines(new_gcode)
@@ -248,7 +255,15 @@ class Layer3DViewerDialog(QDialog):
         reply = QMessageBox.question(self, "Confirm Save", "Are you sure you want to save your edits for this layer?", QMessageBox.Yes | QMessageBox.No)
         if reply == QMessageBox.Yes:
             if self.mainwin and hasattr(self.mainwin, 'save_layer_edits') and self.layer_idx is not None and self.layer_idx >= 0:
-                self.mainwin.save_layer_edits(self.layer_idx, self.moves)
+                # Robust: track all edits as (insert_idx, moves) tuples
+                # For now, assume all edits are at the current slider position
+                # (You can extend this to track multiple edits per session)
+                insert_idx = self.slider.value() - 1 if self.slider.value() > 0 else 0
+                moves_to_insert = [self.moves[insert_idx]] if self.moves else []
+                # If there are already edits for this layer, append; else, start new list
+                edits = self.mainwin.layer_edits.get(self.layer_idx, [])
+                edits.append((insert_idx, moves_to_insert))
+                self.mainwin.save_layer_edits(self.layer_idx, edits)
                 QMessageBox.information(self, "Edits Saved", f"Edits for layer {self.layer_idx} saved in viewer.")
             else:
                 QMessageBox.warning(self, "Save Failed", "Could not find main window or valid layer index to save edits.")
