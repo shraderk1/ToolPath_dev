@@ -187,15 +187,18 @@ class GCodeEditor(QMainWindow):
                 new_gcode = []
                 layer_ptrs = self.layer_indices + [len(self.cleaned_gcode)]
                 for i, (start, end) in enumerate(zip(layer_ptrs[:-1], layer_ptrs[1:])):
+                    # Always add ;LAYER_CHANGE at the start of each saved layer
+                    if self.cleaned_gcode[start].strip() != ';LAYER_CHANGE':
+                        new_gcode.append(';LAYER_CHANGE\n')
+                    else:
+                        new_gcode.append(self.cleaned_gcode[start])
                     if i in self.layer_edits:
-                        orig_lines = list(self.cleaned_gcode[start:end])
+                        orig_lines = list(self.cleaned_gcode[start+1:end])  # skip the original ;LAYER_CHANGE
                         edits = self.layer_edits[i]
-                        # Sort edits by G-code line index (insert_idx) in reverse order
                         edits_sorted = sorted(edits, key=lambda x: x[0], reverse=True)
                         for insert_idx, moves in edits_sorted:
                             gcode_moves = self.moves_to_gcode(moves)
                             orig_lines[insert_idx:insert_idx] = gcode_moves
-                            # Remove only the original move at insert_idx + len(gcode_moves)
                             remove_idx = insert_idx + len(gcode_moves)
                             next_move_line = None
                             if remove_idx < len(orig_lines):
@@ -203,7 +206,6 @@ class GCodeEditor(QMainWindow):
                                 if next_line.startswith(('G0', 'G1', 'G01', 'G2', 'G3')):
                                     next_move_line = orig_lines[remove_idx]
                                     del orig_lines[remove_idx]
-                            # If the next move is an extruding move, insert a bridging travel move
                             if next_move_line and moves:
                                 def parse_xyz_e(line):
                                     x = y = z = e = None
@@ -222,7 +224,6 @@ class GCodeEditor(QMainWindow):
                                     return x, y, z, e
                                 last_edit = moves[-1]
                                 next_x, next_y, next_z, next_e = parse_xyz_e(next_move_line)
-                                # If the next move is extruding (E increases), insert a travel move
                                 if next_e is not None and (abs(next_e - last_edit['e']) > 1e-6):
                                     travel_move = dict(last_edit)
                                     travel_move['x'] = next_x
@@ -230,9 +231,12 @@ class GCodeEditor(QMainWindow):
                                     if next_z is not None:
                                         travel_move['z'] = next_z
                                     travel_move['type'] = 'travel'
-                                    travel_move['e'] = last_edit['e']  # No extrusion
+                                    travel_move['e'] = last_edit['e']
                                     travel_gcode = self.moves_to_gcode([travel_move])
                                     orig_lines[remove_idx:remove_idx] = travel_gcode
+                        new_gcode.extend(orig_lines)
+                    else:
+                        new_gcode.extend(self.cleaned_gcode[start+1:end])
                 with open(file_path, 'w') as file:
                     file.writelines(new_gcode)
                 self.status_bar.showMessage(f"Saved: {file_path}")
