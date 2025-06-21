@@ -149,9 +149,13 @@ class GCodeEditor(QMainWindow):
             x = f"X{m['x']:.3f}" if 'x' in m and m['x'] is not None else ''
             y = f"Y{m['y']:.3f}" if 'y' in m and m['y'] is not None else ''
             z = f"Z{m['z']:.3f}" if 'z' in m and m['z'] is not None else ''
-            e = f"E{m['e']:.5f}" if 'e' in m and m['e'] is not None else ''
-            # Only include E if it changes
-            if last_e is not None and e and float(e[1:]) == last_e:
+            # For travel moves, do not include E or set E to last_e
+            if m.get('type') == 'travel':
+                e = f"E{last_e:.5f}" if last_e is not None else ''
+            else:
+                e = f"E{m['e']:.5f}" if 'e' in m and m['e'] is not None else ''
+            # Only include E if it changes (for non-travel)
+            if last_e is not None and e and float(e[1:]) == last_e and m.get('type') != 'travel':
                 e = ''
             if m['type'] == 'external_perimeter':
                 gcode_lines.append(';TYPE:External perimeter\n')
@@ -162,7 +166,7 @@ class GCodeEditor(QMainWindow):
             # Always use G1 for edited moves
             gline = f"G1 {x} {y} {z} {e}".strip() + '\n'
             gcode_lines.append(gline)
-            if e:
+            if e and m.get('type') != 'travel':
                 try:
                     last_e = float(e[1:])
                 except Exception:
@@ -184,18 +188,51 @@ class GCodeEditor(QMainWindow):
                 layer_ptrs = self.layer_indices + [len(self.cleaned_gcode)]
                 for i, (start, end) in enumerate(zip(layer_ptrs[:-1], layer_ptrs[1:])):
                     if i in self.layer_edits:
-                        # Get original lines for this layer
                         orig_lines = list(self.cleaned_gcode[start:end])
-                        # Get list of (insert_idx, new_moves) for this layer
-                        edits = self.layer_edits[i]  # Should be a list of (insert_idx, moves) tuples
-                        # Sort edits by insert_idx descending so insertion doesn't affect subsequent indices
+                        edits = self.layer_edits[i]
+                        # Sort edits by G-code line index (insert_idx) in reverse order
                         edits_sorted = sorted(edits, key=lambda x: x[0], reverse=True)
                         for insert_idx, moves in edits_sorted:
                             gcode_moves = self.moves_to_gcode(moves)
                             orig_lines[insert_idx:insert_idx] = gcode_moves
-                        new_gcode.extend(orig_lines)
-                    else:
-                        new_gcode.extend(self.cleaned_gcode[start:end])
+                            # Remove only the original move at insert_idx + len(gcode_moves)
+                            remove_idx = insert_idx + len(gcode_moves)
+                            next_move_line = None
+                            if remove_idx < len(orig_lines):
+                                next_line = orig_lines[remove_idx].strip()
+                                if next_line.startswith(('G0', 'G1', 'G01', 'G2', 'G3')):
+                                    next_move_line = orig_lines[remove_idx]
+                                    del orig_lines[remove_idx]
+                            # If the next move is an extruding move, insert a bridging travel move
+                            if next_move_line and moves:
+                                def parse_xyz_e(line):
+                                    x = y = z = e = None
+                                    for part in line.split():
+                                        if part.startswith('X'):
+                                            x = float(part[1:])
+                                        elif part.startswith('Y'):
+                                            y = float(part[1:])
+                                        elif part.startswith('Z'):
+                                            z = float(part[1:])
+                                        elif part.startswith('E'):
+                                            try:
+                                                e = float(part[1:])
+                                            except Exception:
+                                                pass
+                                    return x, y, z, e
+                                last_edit = moves[-1]
+                                next_x, next_y, next_z, next_e = parse_xyz_e(next_move_line)
+                                # If the next move is extruding (E increases), insert a travel move
+                                if next_e is not None and (abs(next_e - last_edit['e']) > 1e-6):
+                                    travel_move = dict(last_edit)
+                                    travel_move['x'] = next_x
+                                    travel_move['y'] = next_y
+                                    if next_z is not None:
+                                        travel_move['z'] = next_z
+                                    travel_move['type'] = 'travel'
+                                    travel_move['e'] = last_edit['e']  # No extrusion
+                                    travel_gcode = self.moves_to_gcode([travel_move])
+                                    orig_lines[remove_idx:remove_idx] = travel_gcode
                 with open(file_path, 'w') as file:
                     file.writelines(new_gcode)
                 self.status_bar.showMessage(f"Saved: {file_path}")
@@ -225,6 +262,23 @@ class GCodeEditor(QMainWindow):
     def save_layer_edits(self, layer_idx, moves):
         self.layer_edits[layer_idx] = moves
 
+    def move_index_to_gcode_line(self, move_idx):
+        """
+        Map a move index (from self.moves) to the corresponding G-code line index in self.layer_lines.
+        Returns the G-code line index where the move at move_idx starts.
+        """
+        move_count = 0
+        for i, line in enumerate(self.layer_lines):
+            line = line.strip()
+            if not line or line.startswith('M'):
+                continue
+            if line.startswith('G0') or line.startswith('G1') or line.startswith('G01') or line.startswith('G2') or line.startswith('G3'):
+                if move_count == move_idx:
+                    return i
+                move_count += 1
+        # If not found, return end of layer
+        return len(self.layer_lines)
+
 class LayerSelectorDialog(QDialog):
     def __init__(self, layer_labels, selected_layers, parent=None):
         super().__init__(parent)
@@ -250,90 +304,6 @@ class LayerSelectorDialog(QDialog):
         return set([i.row() for i in self.list_widget.selectedIndexes()])
 
 class Layer3DViewerDialog(QDialog):
-    def save_edits(self):
-        # Quality check popup before saving
-        reply = QMessageBox.question(self, "Confirm Save", "Are you sure you want to save your edits for this layer?", QMessageBox.Yes | QMessageBox.No)
-        if reply == QMessageBox.Yes:
-            if self.mainwin and hasattr(self.mainwin, 'save_layer_edits') and self.layer_idx is not None and self.layer_idx >= 0:
-                # Robust: track all edits as (insert_idx, moves) tuples
-                # For now, assume all edits are at the current slider position
-                # (You can extend this to track multiple edits per session)
-                insert_idx = self.slider.value() - 1 if self.slider.value() > 0 else 0
-                moves_to_insert = [self.moves[insert_idx]] if self.moves else []
-                # If there are already edits for this layer, append; else, start new list
-                edits = self.mainwin.layer_edits.get(self.layer_idx, [])
-                edits.append((insert_idx, moves_to_insert))
-                self.mainwin.save_layer_edits(self.layer_idx, edits)
-                QMessageBox.information(self, "Edits Saved", f"Edits for layer {self.layer_idx} saved in viewer.")
-            else:
-                QMessageBox.warning(self, "Save Failed", "Could not find main window or valid layer index to save edits.")
-        else:
-            QMessageBox.information(self, "Save Cancelled", "Edits were not saved.")
-
-    def parse_moves(self, lines):
-        moves = []
-        x = y = z = e = None
-        last_x = last_y = last_z = last_e = None
-        current_type = None
-        for line in lines:
-            line = line.strip()
-            if not line or line.startswith('M'):
-                continue
-            if line.startswith(';TYPE:External perimeter'):
-                current_type = 'external_perimeter'
-                continue
-            elif line.startswith(';TYPE:Perimeter'):
-                current_type = 'perimeter'
-                continue
-            elif line.startswith(';TYPE:'):
-                current_type = None
-                continue
-            if line.startswith('G0') or line.startswith('G1') or line.startswith('G01'):
-                parts = line.split()
-                for part in parts:
-                    if part.startswith('X'):
-                        x = float(part[1:])
-                    elif part.startswith('Y'):
-                        y = float(part[1:])
-                    elif part.startswith('Z'):
-                        z = float(part[1:])
-                    elif part.startswith('E'):
-                        try:
-                            e = float(part[1:])
-                        except ValueError:
-                            pass
-                is_travel = False
-                if last_e is not None and (e is None or e == last_e):
-                    is_travel = True
-                if x is not None and y is not None:
-                    moves.append({'x': x, 'y': y, 'z': z if z is not None else (last_z if last_z is not None else 0),
-                                  'e': e if e is not None else (last_e if last_e is not None else 0),
-                                  'type': 'travel' if is_travel else current_type})
-                    last_x, last_y, last_z, last_e = x, y, z if z is not None else last_z, e if e is not None else last_e
-            elif line.startswith('G2') or line.startswith('G3'):
-                parts = line.split()
-                for part in parts:
-                    if part.startswith('X'):
-                        x = float(part[1:])
-                    elif part.startswith('Y'):
-                        y = float(part[1:])
-                    elif part.startswith('Z'):
-                        z = float(part[1:])
-                    elif part.startswith('E'):
-                        try:
-                            e = float(part[1:])
-                        except ValueError:
-                            pass
-                is_travel = False
-                if last_e is not None and (e is None or e == last_e):
-                    is_travel = True
-                if x is not None and y is not None:
-                    moves.append({'x': x, 'y': y, 'z': z if z is not None else (last_z if last_z is not None else 0),
-                                  'e': e if e is not None else (last_e if last_e is not None else 0),
-                                  'type': 'travel' if is_travel else current_type})
-                    last_x, last_y, last_z, last_e = x, y, z if z is not None else last_z, e if e is not None else last_e
-        return moves
-
     def __init__(self, layer_lines, parent=None, mainwin=None, layer_idx=None, moves_override=None):
         super().__init__(parent)
         self.mainwin = mainwin
@@ -445,6 +415,7 @@ class Layer3DViewerDialog(QDialog):
         self.move((screen.width()-w)//2, (screen.height()-h)//2)
         self._is_custom_maximized = False
         self._has_been_shown = False
+        self.edit_inserts = []  # Track all (insert_idx, moves) for this layer
 
     def move_extruder(self, direction):
         if not self.dpad_widget.isVisible():
@@ -496,10 +467,26 @@ class Layer3DViewerDialog(QDialog):
         lifted_move['x'] += dx
         lifted_move['y'] += dy
         lifted_move['z'] = orig_z + actual_lift
+        # Always set travel move type and do not extrude
         lifted_move['type'] = 'travel'
+        lifted_move['e'] = last_move['e']  # No extrusion for travel
         self.moves.insert(idx, lifted_move)
         session['move_stack'].append(move_vec)
         session['current_idx'] = idx
+        # Record the edit as (insert_idx, [move_dicts])
+        insert_idx = self.slider.value() - 1 if self.slider.value() > 0 else 0
+        # Map move index to G-code line index for precise insertion
+        move_idx = self.slider.value() - 1 if self.slider.value() > 0 else 0
+        gcode_line_idx = self.move_index_to_gcode_line(move_idx)
+        moves_to_insert = [self.moves[move_idx]]
+        # --- Multi-move edit support ---
+        # If this is the first move in a new edit session, start a new edit_inserts entry
+        if not self.edit_inserts or self.edit_inserts[-1][0] != self.move_index_to_gcode_line(idx-1):
+            gcode_line_idx = self.move_index_to_gcode_line(idx-1)
+            self.edit_inserts.append((gcode_line_idx, [lifted_move]))
+        else:
+            # Append to the last edit's move list
+            self.edit_inserts[-1][1].append(lifted_move)
         self.manual_origin_idx = session['origin_idx']
         self.manual_current_idx = session['current_idx']
         self.manual_move_stack = session['move_stack']
@@ -685,6 +672,70 @@ class Layer3DViewerDialog(QDialog):
         self.session_color_idx = 0
         self.update_plot()
 
+    def parse_moves(self, lines):
+        moves = []
+        x = y = z = e = None
+        last_x = last_y = last_z = last_e = None
+        current_type = None
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith('M'):
+                continue
+            if line.startswith(';TYPE:External perimeter'):
+                current_type = 'external_perimeter'
+                continue
+            elif line.startswith(';TYPE:Perimeter'):
+                current_type = 'perimeter'
+                continue
+            elif line.startswith(';TYPE:'):
+                current_type = None
+                continue
+            if line.startswith('G0') or line.startswith('G1') or line.startswith('G01'):
+                parts = line.split()
+                for part in parts:
+                    if part.startswith('X'):
+                        x = float(part[1:])
+                    elif part.startswith('Y'):
+                        y = float(part[1:])
+                    elif part.startswith('Z'):
+                        z = float(part[1:])
+                    elif part.startswith('E'):
+                        try:
+                            e = float(part[1:])
+                        except ValueError:
+                            pass
+                is_travel = False
+                if last_e is not None and (e is None or e == last_e):
+                    is_travel = True
+                if x is not None and y is not None:
+                    moves.append({'x': x, 'y': y, 'z': z if z is not None else (last_z if last_z is not None else 0),
+                                  'e': e if e is not None else (last_e if last_e is not None else 0),
+                                  'type': 'travel' if is_travel else current_type})
+                    last_x, last_y, last_z, last_e = x, y, z if z is not None else last_z, e if e is not None else last_e
+            elif line.startswith('G2') or line.startswith('G3'):
+                parts = line.split()
+                for part in parts:
+                    if part.startswith('X'):
+                        x = float(part[1:])
+                    elif part.startswith('Y'):
+                        y = float(part[1:])
+                    elif part.startswith('Z'):
+                        z = float(part[1:])
+                    elif part.startswith('E'):
+                        try:
+                            e = float(part[1:])
+                        except ValueError:
+                            pass
+                is_travel = False
+                if last_e is not None and (e is None or e == last_e):
+                    is_travel = True
+                if x is not None and y is not None:
+                    moves.append({'x': x, 'y': y, 'z': z if z is not None else (last_z if last_z is not None else 0),
+                                  'e': e if e is not None else (last_e if last_e is not None else 0),
+                                  'type': 'travel' if is_travel else current_type})
+                    last_x, last_y, last_z, last_e = x, y, z if z is not None else last_z, e if e is not None else last_e
+        return moves
+
     def showEvent(self, event):
         # Always minimize to 25% the first time the dialog is shown and set state
         if not hasattr(self, '_has_been_shown') or not self._has_been_shown:
@@ -717,6 +768,29 @@ class Layer3DViewerDialog(QDialog):
         # Hide instead of destroy, to persist OpenGL context
         self.hide()
         event.ignore()
+
+    def save_edits(self):
+        # Save all current edit insertions for this layer back to the main window
+        if not hasattr(self, 'edit_inserts'):
+            self.edit_inserts = []
+        if self.mainwin and hasattr(self.mainwin, 'save_layer_edits'):
+            self.mainwin.save_layer_edits(self.layer_idx, list(self.edit_inserts))
+            QMessageBox.information(self, "Edits Saved", f"Edits for layer {self.layer_idx} saved.")
+        else:
+            QMessageBox.warning(self, "Warning", "Could not save edits: main window not found.")
+
+    # Map a move index (from self.moves) to the corresponding G-code line index in self.layer_lines.
+    def move_index_to_gcode_line(self, move_idx):
+        move_count = 0
+        for i, line in enumerate(self.layer_lines):
+            line = line.strip()
+            if not line or line.startswith('M'):
+                continue
+            if line.startswith('G0') or line.startswith('G1') or line.startswith('G01') or line.startswith('G2') or line.startswith('G3'):
+                if move_count == move_idx:
+                    return i
+                move_count += 1
+        return len(self.layer_lines)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
