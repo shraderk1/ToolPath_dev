@@ -194,47 +194,64 @@ class GCodeEditor(QMainWindow):
                         new_gcode.append(self.cleaned_gcode[start])
                     if i in self.layer_edits:
                         orig_lines = list(self.cleaned_gcode[start+1:end])  # skip the original ;LAYER_CHANGE
+                        # 1. Parse all moves and collect non-move lines with their indices
+                        moves = []
+                        non_move_lines = []  # (idx, line)
+                        gcode_to_move_idx = {}  # Map G-code line idx -> move idx
+                        move_counter = 0
+                        for idx, line in enumerate(orig_lines):
+                            l = line.strip()
+                            if l.startswith(('G0', 'G1', 'G01', 'G2', 'G3')):
+                                # Parse move
+                                parts = l.split()
+                                move = {'type': None, 'x': None, 'y': None, 'z': None, 'e': None}
+                                for part in parts:
+                                    if part.startswith('X'):
+                                        move['x'] = float(part[1:])
+                                    elif part.startswith('Y'):
+                                        move['y'] = float(part[1:])
+                                    elif part.startswith('Z'):
+                                        move['z'] = float(part[1:])
+                                    elif part.startswith('E'):
+                                        move['e'] = float(part[1:])
+                                # Try to infer type from previous comment
+                                if idx > 0 and orig_lines[idx-1].strip().startswith(';TYPE:'):
+                                    move['type'] = orig_lines[idx-1].strip()[6:].lower()
+                                moves.append(move)
+                                gcode_to_move_idx[idx] = move_counter
+                                move_counter += 1
+                            else:
+                                non_move_lines.append((idx, line))
+                        # 2. Apply all edits to the move list (using move dicts from the 3D viewer)
                         edits = self.layer_edits[i]
-                        edits_sorted = sorted(edits, key=lambda x: x[0], reverse=True)
-                        for insert_idx, moves in edits_sorted:
-                            gcode_moves = self.moves_to_gcode(moves)
-                            orig_lines[insert_idx:insert_idx] = gcode_moves
-                            remove_idx = insert_idx + len(gcode_moves)
-                            next_move_line = None
-                            if remove_idx < len(orig_lines):
-                                next_line = orig_lines[remove_idx].strip()
-                                if next_line.startswith(('G0', 'G1', 'G01', 'G2', 'G3')):
-                                    next_move_line = orig_lines[remove_idx]
-                                    del orig_lines[remove_idx]
-                            if next_move_line and moves:
-                                def parse_xyz_e(line):
-                                    x = y = z = e = None
-                                    for part in line.split():
-                                        if part.startswith('X'):
-                                            x = float(part[1:])
-                                        elif part.startswith('Y'):
-                                            y = float(part[1:])
-                                        elif part.startswith('Z'):
-                                            z = float(part[1:])
-                                        elif part.startswith('E'):
-                                            try:
-                                                e = float(part[1:])
-                                            except Exception:
-                                                pass
-                                    return x, y, z, e
-                                last_edit = moves[-1]
-                                next_x, next_y, next_z, next_e = parse_xyz_e(next_move_line)
-                                if next_e is not None and (abs(next_e - last_edit['e']) > 1e-6):
-                                    travel_move = dict(last_edit)
-                                    travel_move['x'] = next_x
-                                    travel_move['y'] = next_y
-                                    if next_z is not None:
-                                        travel_move['z'] = next_z
-                                    travel_move['type'] = 'travel'
-                                    travel_move['e'] = last_edit['e']
-                                    travel_gcode = self.moves_to_gcode([travel_move])
-                                    orig_lines[remove_idx:remove_idx] = travel_gcode
-                        new_gcode.extend(orig_lines)
+                        offset = 0
+                        for gcode_idx, edit_moves in sorted(edits, key=lambda x: x[0]):
+                            # Map G-code line index to move index
+                            move_idx = gcode_to_move_idx.get(gcode_idx, None)
+                            if move_idx is None:
+                                continue  # Skip if not a move line
+                            move_idx += offset
+                            for m in edit_moves:
+                                m['type'] = 'travel'
+                            # Replace the move at move_idx with the edited moves
+                            moves[move_idx:move_idx+1] = edit_moves
+                            # Patch the next move to be a travel move
+                            next_idx = move_idx + len(edit_moves)
+                            if next_idx < len(moves):
+                                patch = dict(edit_moves[-1])
+                                patch['x'] = moves[next_idx]['x']
+                                patch['y'] = moves[next_idx]['y']
+                                patch['z'] = moves[next_idx]['z']
+                                patch['type'] = 'travel'
+                                patch['e'] = edit_moves[-1]['e']
+                                moves[next_idx] = patch
+                            offset += len(edit_moves) - 1
+                        # 3. Regenerate G-code for the layer from the move list
+                        gcode_lines = self.moves_to_gcode(moves)
+                        # 4. Re-insert all non-move lines at their original indices
+                        for idx, line in non_move_lines:
+                            gcode_lines.insert(idx, line)
+                        new_gcode.extend(gcode_lines)
                     else:
                         new_gcode.extend(self.cleaned_gcode[start+1:end])
                 with open(file_path, 'w') as file:
