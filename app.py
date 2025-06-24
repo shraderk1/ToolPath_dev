@@ -211,20 +211,13 @@ class GCodeEditor(QMainWindow):
 
         if self.viewer_dialog is None:
             self.viewer_dialog = Layer3DViewerDialog(
-                # `moves_override` expects list of dicts
-                moves_override=list(moves_for_viewer_dicts), # Ensure it's a new list of dicts
                 mainwin=self,
-                # Pass the document layer index for callback
                 layer_idx_in_doc=doc_layer_idx,
                 actual_layer_display_number=actual_layer_display_number,
-                # `non_move_lines_map` from GCodeLayer could be passed if viewer uses it
-                # For now, viewer works primarily off the sequence of moves.
-                # The full `layer_items_for_viewer` could be passed if viewer is adapted.
                 initial_layer_items=list(layer_items_for_viewer) # Pass the full current items list
             )
         else:
             self.viewer_dialog.set_layer_data(
-                moves_override=list(moves_for_viewer_dicts),
                 layer_idx_in_doc=doc_layer_idx,
                 actual_layer_display_number=actual_layer_display_number,
                 initial_layer_items=list(layer_items_for_viewer)
@@ -285,7 +278,7 @@ class LayerSelectorDialog(QDialog): # Mostly unchanged
 
     def get_selected_layers(self):
         # Returns a set of indices corresponding to items in document.layers
-        return set([item.row() for item in self.list_widget.selectedItems()])
+        return set([self.list_widget.row(item) for item in self.list_widget.selectedItems()])
 
 
 class Layer3DViewerDialog(QDialog):
@@ -353,15 +346,40 @@ class Layer3DViewerDialog(QDialog):
         dpad_layout.setSpacing(2)
         self.dpad_buttons = {}
         directions = {
-            (0,1): ("▲", "up"), (0,2): ("↗", "up_right"), (1,0): ("◀", "left"),
-            (1,1): ("●", None), (1,2): ("▶", "right"), (2,0): ("↙", "down_left"),
-            (2,1): ("▼", "down"), (2,2): ("↘", "down_right"), (0,0): ("↖", "up_left"),
+            (0,1): ("▲", "up"),
+            (1,2): ("▶", "right"),
+            (2,1): ("▼", "down"),
+            (1,0): ("◀", "left"),
+            (0,0): ("↖", "up_left"),
+            (0,2): ("↗", "up_right"),
+            (2,0): ("↙", "down_left"),
+            (2,2): ("↘", "down_right"),
+            (1,1): ("●", None),
         }
+        # Map each D-pad button to the requested movement direction:
+        # up: -Y, down: +Y, left: +X, right: -X, and fix diagonals accordingly
         for (row, col), (label, direction) in directions.items():
             btn = QPushButton(label)
             btn.setFixedSize(32,32)
-            if direction: # Center button has no direction
-                btn.clicked.connect(lambda checked, d=direction: self.handle_dpad_move(d))
+            if direction:
+                if direction in ["up", "down", "left", "right"]:
+                    # Custom grid positions for the intended movement
+                    grid_map = {
+                        "up": (2,1),      # up (negative Y)
+                        "down": (0,1),    # down (positive Y)
+                        "left": (1,2),    # left (positive X)
+                        "right": (1,0),   # right (negative X)
+                    }
+                    btn.clicked.connect(lambda checked, g=grid_map[direction]: self.handle_dpad_move_grid(g))
+                else:
+                    # Diagonal mapping: combine the correct signs for X and Y
+                    diag_map = {
+                        "up_left": (2,2),      # (+X, -Y)
+                        "up_right": (2,0),     # (-X, -Y)
+                        "down_left": (0,2),    # (+X, +Y)
+                        "down_right": (0,0),   # (-X, +Y)
+                    }
+                    btn.clicked.connect(lambda checked, g=diag_map[direction]: self.handle_dpad_move_grid(g))
             self.dpad_buttons[direction] = btn
             dpad_layout.addWidget(btn, row, col)
         self.dpad_widget.setLayout(dpad_layout)
@@ -418,8 +436,7 @@ class Layer3DViewerDialog(QDialog):
         # self.arrow_forward = arrow_forward
 
     # Replaces original set_layer and parts of __init__
-    def set_layer_data(self, moves_override=None, layer_idx_in_doc=None,
-                       actual_layer_display_number=None, initial_layer_items=None):
+    def set_layer_data(self, layer_idx_in_doc=None, actual_layer_display_number=None, initial_layer_items=None):
 
         self.layer_idx_in_doc = layer_idx_in_doc if layer_idx_in_doc is not None else self.layer_idx_in_doc
         self.actual_layer_display_number = actual_layer_display_number if actual_layer_display_number is not None else self.actual_layer_display_number
@@ -459,14 +476,17 @@ class Layer3DViewerDialog(QDialog):
             # self._setup_camera_for_plot(np.array([]))
             return
 
-        # points_to_render_np are the coordinates of the moves to be shown.
-        # If slider is at 1, we show the first point (current_display_moves[0]).
-        # If slider is at N, we show N points (current_display_moves[0]...[N-1]).
-        points_to_render_np = np.array([[m['x'], m['y'], m['z']] for m in self.current_display_moves[:num_render_points]])
+        # Filter out moves with None for x, y, or z
+        filtered_moves = [m for m in self.current_display_moves[:num_render_points] if m['x'] is not None and m['y'] is not None and m['z'] is not None]
+        if not filtered_moves:
+            self.status_label.setText("No valid moves to display.")
+            return
+
+        points_to_render_np = np.array([[m['x'], m['y'], m['z']] for m in filtered_moves])
 
         grid = gl.GLGridItem()
         # Dynamic grid sizing based on all points in the layer for consistent view
-        all_points_for_grid = np.array([[m['x'], m['y'], m['z']] for m in self.current_display_moves])
+        all_points_for_grid = np.array([[m['x'], m['y'], m['z']] for m in self.current_display_moves if m['x'] is not None and m['y'] is not None and m['z'] is not None])
         if all_points_for_grid.size >0:
             x_span = np.ptp(all_points_for_grid[:,0]) if all_points_for_grid.shape[0] > 0 else 100
             y_span = np.ptp(all_points_for_grid[:,1]) if all_points_for_grid.shape[0] > 0 else 100
@@ -479,13 +499,11 @@ class Layer3DViewerDialog(QDialog):
             grid.translate(center_x, center_y, 0) # Assuming Z=0 for grid plane
         self.gl_widget.addItem(grid)
 
-
         # Draw toolpath segments. A segment exists from point i-1 to point i.
         # This segment corresponds to the properties of move i (the end point of the segment).
-        for i in range(1, num_render_points): # Loop from 1 up to num_render_points-1
+        for i in range(1, len(filtered_moves)):
             segment_coords_np = np.array([points_to_render_np[i-1], points_to_render_np[i]])
-            # Properties of the move that *ends* at points_to_render_np[i] are in self.current_display_moves[i]
-            move_properties_dict = self.current_display_moves[i]
+            move_properties_dict = filtered_moves[i]
 
             color, width, antialias, is_dotted = self._get_segment_style_from_move(move_properties_dict)
 
@@ -519,13 +537,12 @@ class Layer3DViewerDialog(QDialog):
                         edit_line = gl.GLLinePlotItem(pos=seg_np, color=session['color'], width=7, antialias=True, mode='lines')
                         self.gl_widget.addItem(edit_line)
 
-
         # Draw extruder head at the current position (the last point in points_to_render_np)
-        if num_render_points > 0:
-            extruder_pos_np = points_to_render_np[num_render_points - 1]
+        if len(points_to_render_np) > 0:
+            extruder_pos_np = points_to_render_np[-1]  # Use last valid point, not num_render_points-1
             self._draw_extruder_head_at(extruder_pos_np)
 
-        self.status_label.setText(f"Move {num_render_points} / {len(self.current_display_moves)}")
+        self.status_label.setText(f"Move {len(filtered_moves)} / {len(self.current_display_moves)}")
 
         # Setup camera based on all points in the layer for consistent framing
         if all_points_for_grid.size > 0:
@@ -563,7 +580,7 @@ class Layer3DViewerDialog(QDialog):
     def _setup_camera_for_plot(self, points_np_array): # Was _setup_camera
         if points_np_array.shape[0] == 0:
             # Default camera for empty plot
-            self.gl_widget.setCameraPosition(distance=100, elevation=30, azimuth=45)
+            self.gl_widget.setCameraPosition(distance=100, elevation=90, azimuth=0)  # Top-down
             return
 
         min_coords = points_np_array.min(axis=0)
@@ -574,8 +591,8 @@ class Layer3DViewerDialog(QDialog):
         obj_span = max_coords - min_coords
         distance = max(obj_span[0], obj_span[1], obj_span[2], 20) * 1.5 # Ensure object fits, min distance 20*1.5
 
-        self.gl_widget.setCameraPosition(pos=center_vec, distance=distance, elevation=30, azimuth=45) # Default angles
-
+        # Always use top-down view: elevation=90, azimuth=0
+        self.gl_widget.setCameraPosition(pos=center_vec, distance=distance, elevation=90, azimuth=0)
 
     def step_slider_backward_action(self): # Was slider_back
         val = self.slider.value()
@@ -651,117 +668,144 @@ class Layer3DViewerDialog(QDialog):
         self.update_plot_and_slider_status()
 
 
-    def handle_dpad_move(self, direction_key): # Was move_extruder
+    def handle_dpad_move(self, direction_key):
+        # Only used for fallback/diagonals
         if not self.editor_active or not self.edit_sessions or not self.items:
             return
-
         current_session = self.edit_sessions[-1]
-        # `idx_of_item_to_insert_after` is the index in `self.items` list of the item (Move or string)
-        # *after which* the new D-pad move will be inserted. This is current_session['current_tip_item_idx_in_items'].
         idx_of_item_to_insert_after = current_session['current_tip_item_idx_in_items']
-
         if not (0 <= idx_of_item_to_insert_after < len(self.items)): return
-
-        # The actual coordinates to move *from* are in current_session['current_tip_coords_np']
         last_coords_np = current_session['current_tip_coords_np']
-        # The logical E value should come from the Move object at current_session['current_tip_item_idx_in_items']
-        # if it's a Move object, or track separately. For simplicity, assume last E from that Move.
-
         last_e_value = 0.0 # Default E
         if isinstance(self.items[idx_of_item_to_insert_after], Move):
             last_e_value = self.items[idx_of_item_to_insert_after].e or 0.0
-
-
-        dir_vectors_xy = { # Standard cartesian: Y up, X right
-            "up": np.array([0, 2.0]), "down": np.array([0, -2.0]),
-            "left": np.array([-2.0, 0]), "right": np.array([2.0, 0]),
-            "up_right": np.array([2.0, 2.0]) * (2.0**0.5 / 2), "up_left": np.array([-2.0, 2.0]) * (2.0**0.5 / 2),
-            "down_right": np.array([2.0, -2.0]) * (2.0**0.5 / 2), "down_left": np.array([-2.0, -2.0]) * (2.0**0.5 / 2),
+        d = 2.0
+        d_diag = d * (2 ** 0.5) / 2
+        # Only fallback for diagonals
+        dir_vectors_xy = {
+            "up_right": np.array([d_diag, -d_diag]),
+            "up_left": np.array([d_diag, d_diag]),
+            "down_right": np.array([-d_diag, -d_diag]),
+            "down_left": np.array([-d_diag, d_diag]),
         }
         delta_xy = dir_vectors_xy.get(direction_key)
-        if delta_xy is None: return
-
+        if delta_xy is None:
+            return
         # Basic undo: if move is opposite to last dpad delta in session
         if current_session['dpad_deltas_this_session']:
             last_delta = current_session['dpad_deltas_this_session'][-1]
             if np.allclose(delta_xy, -last_delta):
-                # Remove the last inserted Move object from self.items
-                # It was inserted at idx_of_item_to_insert_after + 1 (relative to *its* previous state)
-                # The current idx_of_item_to_insert_after is the index of the move we just inserted.
                 if 0 <= idx_of_item_to_insert_after < len(self.items) and \
                    isinstance(self.items[idx_of_item_to_insert_after], Move) and \
-                   self.items[idx_of_item_to_insert_after].type == 'travel_edit': # Check if it's an edit move
-
+                   self.items[idx_of_item_to_insert_after].type == 'travel_edit':
                     self.items.pop(idx_of_item_to_insert_after)
                     current_session['dpad_deltas_this_session'].pop()
-                    # Update current_tip_item_idx_in_items to point to the item *before* the popped one.
                     current_session['current_tip_item_idx_in_items'] = idx_of_item_to_insert_after -1
-                    # Update current_tip_coords_np
                     if isinstance(self.items[current_session['current_tip_item_idx_in_items']], Move):
                         prev_move_obj = self.items[current_session['current_tip_item_idx_in_items']]
                         current_session['current_tip_coords_np'] = np.array([prev_move_obj.x, prev_move_obj.y, prev_move_obj.z])
-
-                    self.current_display_moves = self._get_move_dicts_from_items() # Crucial update
+                    self.current_display_moves = self._get_move_dicts_from_items()
                     self.slider.setMaximum(len(self.current_display_moves) if self.current_display_moves else 1)
-                    # Slider should point to the new tip. Find its index in current_display_moves.
-                    # This is complex. For now, just decrement slider if it was at max.
                     if self.slider.value() > 1 : self.slider.setValue(self.slider.value() -1)
                     self.update_plot_and_slider_status()
                     return
-
         new_x = last_coords_np[0] + delta_xy[0]
         new_y = last_coords_np[1] + delta_xy[1]
         lift_height = 1.0
         new_z = last_coords_np[2] + lift_height
-
-        new_move_obj = Move(x=new_x, y=new_y, z=new_z, e=last_e_value, # Maintain last E for travel
-                              move_type='travel_edit', # Special type for these edits
-                              original_line_index=None) # This is an inserted move
-
-        # Insert the new Move object into self.items list
+        new_move_obj = Move(x=new_x, y=new_y, z=new_z, e=last_e_value, move_type='travel_edit', original_line_index=None)
         insert_at_item_idx = idx_of_item_to_insert_after + 1
         self.items.insert(insert_at_item_idx, new_move_obj)
-
-        # Update session
         current_session['dpad_deltas_this_session'].append(delta_xy)
         current_session['current_tip_item_idx_in_items'] = insert_at_item_idx
         current_session['current_tip_coords_np'] = np.array([new_x, new_y, new_z])
-
-        # Update display_moves and slider
         self.current_display_moves = self._get_move_dicts_from_items()
         self.slider.setMaximum(len(self.current_display_moves) if self.current_display_moves else 1)
-        # Try to set slider to the newly added move. Find its index in current_display_moves.
-        new_move_dict_idx = -1
-        temp_move_dicts = self._get_move_dicts_from_items() # regenerate to be sure
-        for i, md in enumerate(temp_move_dicts):
-            # Compare by object identity if possible, or by exact coords (less reliable for floats)
-            # This is tricky if new_move_obj was copied. Assuming to_dict() gives comparable values.
-            if md['x'] == new_x and md['y'] == new_y and md['z'] == new_z and md['type'] == 'travel_edit':
-                 # This might match multiple if user goes back and forth.
-                 # A better way: new_move_obj should be the one in self.items.
-                 # Find index of new_move_obj in self.items, then map to display_moves index.
-                 # This is still complex. For now, just advance slider.
-                 pass
-
-        # Find the index of the new_move_obj in current_display_moves
-        # This requires careful indexing as current_display_moves only contains Move objects.
         newly_inserted_move_display_idx = -1
         move_count = 0
         for item_idx, item_val in enumerate(self.items):
-            if item_val is new_move_obj: # Check object identity
+            if item_val is new_move_obj:
                 newly_inserted_move_display_idx = move_count
                 break
             if isinstance(item_val, Move):
                 move_count += 1
-
         if newly_inserted_move_display_idx != -1:
-            self.slider.setValue(newly_inserted_move_display_idx + 1) # Slider is 1-based
-        else: # Fallback, just increment if possible
-             if self.slider.value() < self.slider.maximum(): self.slider.setValue(self.slider.value()+1)
-
-
+            self.slider.setValue(newly_inserted_move_display_idx + 1)
+        else:
+            if self.slider.value() < self.slider.maximum(): self.slider.setValue(self.slider.value()+1)
         self.update_plot_and_slider_status()
 
+    def handle_dpad_move_grid(self, grid_pos):
+        # Map grid_pos to movement vector
+        d = 2.0
+        d_diag = d * (2 ** 0.5) / 2
+        grid_to_delta = {
+            (1,0): np.array([0, d]),      # up
+            (1,2): np.array([0, -d]),     # down
+            (0,1): np.array([d, 0]),      # right
+            (2,1): np.array([-d, 0]),     # left
+            (0,0): np.array([d_diag, d_diag]),      # up_left
+            (0,2): np.array([d_diag, -d_diag]),     # up_right
+            (2,0): np.array([-d_diag, d_diag]),     # down_left
+            (2,2): np.array([-d_diag, -d_diag]),    # down_right
+        }
+        direction_key = None # Not used in this handler
+        delta_xy = grid_to_delta.get(grid_pos)
+        if delta_xy is None:
+            return
+        # The rest of this function is the same as handle_dpad_move, but uses delta_xy
+        if not self.editor_active or not self.edit_sessions or not self.items:
+            return
+        current_session = self.edit_sessions[-1]
+        idx_of_item_to_insert_after = current_session['current_tip_item_idx_in_items']
+        if not (0 <= idx_of_item_to_insert_after < len(self.items)): return
+        last_coords_np = current_session['current_tip_coords_np']
+        last_e_value = 0.0 # Default E
+        if isinstance(self.items[idx_of_item_to_insert_after], Move):
+            last_e_value = self.items[idx_of_item_to_insert_after].e or 0.0
+        # Basic undo: if move is opposite to last dpad delta in session
+        if current_session['dpad_deltas_this_session']:
+            last_delta = current_session['dpad_deltas_this_session'][-1]
+            if np.allclose(delta_xy, -last_delta):
+                if 0 <= idx_of_item_to_insert_after < len(self.items) and \
+                   isinstance(self.items[idx_of_item_to_insert_after], Move) and \
+                   self.items[idx_of_item_to_insert_after].type == 'travel_edit':
+                    self.items.pop(idx_of_item_to_insert_after)
+                    current_session['dpad_deltas_this_session'].pop()
+                    current_session['current_tip_item_idx_in_items'] = idx_of_item_to_insert_after -1
+                    if isinstance(self.items[current_session['current_tip_item_idx_in_items']], Move):
+                        prev_move_obj = self.items[current_session['current_tip_item_idx_in_items']]
+                        current_session['current_tip_coords_np'] = np.array([prev_move_obj.x, prev_move_obj.y, prev_move_obj.z])
+                    self.current_display_moves = self._get_move_dicts_from_items()
+                    self.slider.setMaximum(len(self.current_display_moves) if self.current_display_moves else 1)
+                    if self.slider.value() > 1 : self.slider.setValue(self.slider.value() -1)
+                    self.update_plot_and_slider_status()
+                    return
+        new_x = last_coords_np[0] + delta_xy[0]
+        new_y = last_coords_np[1] + delta_xy[1]
+        lift_height = 1.0
+        new_z = last_coords_np[2] + lift_height
+        new_move_obj = Move(x=new_x, y=new_y, z=new_z, e=last_e_value, move_type='travel_edit', original_line_index=None)
+        insert_at_item_idx = idx_of_item_to_insert_after + 1
+        self.items.insert(insert_at_item_idx, new_move_obj)
+        current_session['dpad_deltas_this_session'].append(delta_xy)
+        current_session['current_tip_item_idx_in_items'] = insert_at_item_idx
+        current_session['current_tip_coords_np'] = np.array([new_x, new_y, new_z])
+        self.current_display_moves = self._get_move_dicts_from_items()
+        self.slider.setMaximum(len(self.current_display_moves) if self.current_display_moves else 1)
+        newly_inserted_move_display_idx = -1
+        move_count = 0
+        for item_idx, item_val in enumerate(self.items):
+            if item_val is new_move_obj:
+                newly_inserted_move_display_idx = move_count
+                break
+            if isinstance(item_val, Move):
+                move_count += 1
+        if newly_inserted_move_display_idx != -1:
+            self.slider.setValue(newly_inserted_move_display_idx + 1)
+        else:
+            if self.slider.value() < self.slider.maximum(): self.slider.setValue(self.slider.value()+1)
+        self.update_plot_and_slider_status()
 
     def trigger_apply_edits_to_mainwin(self): # Was save_edits
         if self.mainwin and hasattr(self.mainwin, 'record_layer_edits'):
@@ -801,8 +845,6 @@ class Layer3DViewerDialog(QDialog):
         event.ignore()
 
     # move_index_to_gcode_line - Removed. Mapping is now based on self.items and its relation to self.current_display_moves.
-    # If such a mapping is needed, it would be more complex.
-
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = GCodeEditor()
