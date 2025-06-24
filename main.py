@@ -144,33 +144,58 @@ class GCodeEditor(QMainWindow):
     def moves_to_gcode(self, moves):
         # Convert moves (list of dicts) back to G-code lines
         gcode_lines = []
-        last_e = None
+        last_e_val_in_gcode = None # Tracks the E value actually written in the last G-code line that had an E.
+
         for m in moves:
-            x = f"X{m['x']:.3f}" if 'x' in m and m['x'] is not None else ''
-            y = f"Y{m['y']:.3f}" if 'y' in m and m['y'] is not None else ''
-            z = f"Z{m['z']:.3f}" if 'z' in m and m['z'] is not None else ''
-            # For travel moves, do not include E or set E to last_e
+            x_str = f"X{m['x']:.3f}" if 'x' in m and m['x'] is not None else ''
+            y_str = f"Y{m['y']:.3f}" if 'y' in m and m['y'] is not None else ''
+            z_str = f"Z{m['z']:.3f}" if 'z' in m and m['z'] is not None else ''
+            e_str = '' # Default to no E parameter
+
             if m.get('type') == 'travel':
-                e = f"E{last_e:.5f}" if last_e is not None else ''
-            else:
-                e = f"E{m['e']:.5f}" if 'e' in m and m['e'] is not None else ''
-            # Only include E if it changes (for non-travel)
-            if last_e is not None and e and float(e[1:]) == last_e and m.get('type') != 'travel':
-                e = ''
-            if m['type'] == 'external_perimeter':
+                # For travel moves, no E parameter is written.
+                # The extruder holds its position from the last extrusion.
+                # The m['e'] in the move dictionary should still reflect this logical extruder position.
+                pass # e_str remains empty, so no E parameter will be added to the G-code line.
+            else: # Non-travel (presumably extrusion)
+                if 'e' in m and m['e'] is not None:
+                    current_move_e_val = m['e']
+                    # Write E only if it's different from the last written E value, 
+                    # or if no E has been written yet in this sequence of moves.
+                    if last_e_val_in_gcode is None or abs(current_move_e_val - last_e_val_in_gcode) > 1e-5: # Use 1e-5 for float comparison
+                        e_str = f"E{current_move_e_val:.5f}"
+                        # Update last_e_val_in_gcode because we are deciding to write this E value.
+                        last_e_val_in_gcode = current_move_e_val
+                    # If E is same as last written, e_str remains empty (no redundant E parameter)
+                # If a non-travel move has no 'e' in its dictionary (e.g., a G1 Z-only move), 
+                # e_str remains empty, which is correct.
+
+            # Add type comments before the G-code line
+            # These comments help identify the purpose of the following G-code move.
+            if m.get('type') == 'external_perimeter':
                 gcode_lines.append(';TYPE:External perimeter\n')
-            elif m['type'] == 'perimeter':
+            elif m.get('type') == 'perimeter':
                 gcode_lines.append(';TYPE:Perimeter\n')
-            elif m['type'] is None:
-                pass
-            # Always use G1 for edited moves
-            gline = f"G1 {x} {y} {z} {e}".strip() + '\n'
-            gcode_lines.append(gline)
-            if e and m.get('type') != 'travel':
-                try:
-                    last_e = float(e[1:])
-                except Exception:
-                    pass
+            # Not adding ;TYPE:Travel as it's usually implicit by lack of E or specific G0 command (though we use G1 for all moves).
+            # Other types like 'None' will not have a comment.
+
+            # Construct the G-code line.
+            # All moves are currently written as G1, as per the original code's behavior.
+            gline_parts = ["G1"]
+            if x_str: gline_parts.append(x_str)
+            if y_str: gline_parts.append(y_str)
+            if z_str: gline_parts.append(z_str)
+            if e_str: gline_parts.append(e_str)
+            
+            gline = " ".join(gline_parts)
+
+            # Only add the line if it's more than just "G1" (i.e., it has parameters).
+            # A "G1" line by itself is invalid.
+            if len(gline_parts) > 1:
+                gcode_lines.append(gline + '\n')
+            # If the line was just "G1" but it was supposed to be an E-only move where E didn't change,
+            # it's correctly omitted. If it was a travel move with no X,Y,Z change, it's also omitted.
+
         return gcode_lines
 
     def save_gcode_file(self):
