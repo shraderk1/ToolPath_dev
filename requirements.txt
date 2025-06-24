@@ -1,0 +1,4 @@
+# requirements.txt
+pyqt5
+pyqtgraph
+numpy
