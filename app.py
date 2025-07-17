@@ -318,7 +318,10 @@ class Layer3DViewerDialog(QDialog):
         self.update_plot_and_slider_status() # Renamed
 
     def _get_move_dicts_from_items(self):
-        """Extracts move dictionaries from self.items for visualization."""
+        """
+        Extracts move dictionaries from self.items for visualization, preserving exact order and sequence.
+        Every Move object is included in order; non-move lines are ignored for plotting but not skipped in sequence.
+        """
         move_dicts = []
         for item in self.items:
             if isinstance(item, Move):
@@ -465,29 +468,36 @@ class Layer3DViewerDialog(QDialog):
         self.current_slider_index = value
         self.update_plot_and_slider_status()
 
-    def update_plot_and_slider_status(self): # Was update_plot
+
+    def update_plot_and_slider_status(self):
         self.gl_widget.clear()
 
-        num_render_points = self.current_slider_index # This is 1-based from slider, meaning number of points to consider
+        # Build a list of Move objects in order, up to the current slider index (1-based)
+        moves_to_render = []
+        count = 0
+        for item in self.items:
+            if isinstance(item, Move):
+                count += 1
+                if count > self.current_slider_index:
+                    break
+                moves_to_render.append(item)
 
-        if not self.current_display_moves or num_render_points == 0:
+        if not moves_to_render:
             self.status_label.setText("No moves to display.")
-            # Setup camera for empty grid if needed
-            # self._setup_camera_for_plot(np.array([]))
             return
 
-        # Filter out moves with None for x, y, or z
-        filtered_moves = [m for m in self.current_display_moves[:num_render_points] if m['x'] is not None and m['y'] is not None and m['z'] is not None]
+        # Only plot moves with valid coordinates
+        filtered_moves = [m for m in moves_to_render if m.x is not None and m.y is not None and m.z is not None]
         if not filtered_moves:
             self.status_label.setText("No valid moves to display.")
             return
 
-        points_to_render_np = np.array([[m['x'], m['y'], m['z']] for m in filtered_moves])
+        points_to_render_np = np.array([[m.x, m.y, m.z] for m in filtered_moves])
 
         grid = gl.GLGridItem()
         # Dynamic grid sizing based on all points in the layer for consistent view
-        all_points_for_grid = np.array([[m['x'], m['y'], m['z']] for m in self.current_display_moves if m['x'] is not None and m['y'] is not None and m['z'] is not None])
-        if all_points_for_grid.size >0:
+        all_points_for_grid = np.array([[m.x, m.y, m.z] for m in self.items if isinstance(m, Move) and m.x is not None and m.y is not None and m.z is not None])
+        if all_points_for_grid.size > 0:
             x_span = np.ptp(all_points_for_grid[:,0]) if all_points_for_grid.shape[0] > 0 else 100
             y_span = np.ptp(all_points_for_grid[:,1]) if all_points_for_grid.shape[0] > 0 else 100
             grid_size = max(x_span, y_span, 20) # Ensure grid is at least 20x20
@@ -503,7 +513,7 @@ class Layer3DViewerDialog(QDialog):
         # This segment corresponds to the properties of move i (the end point of the segment).
         for i in range(1, len(filtered_moves)):
             segment_coords_np = np.array([points_to_render_np[i-1], points_to_render_np[i]])
-            move_properties_dict = filtered_moves[i]
+            move_properties_dict = filtered_moves[i].to_dict()
 
             color, width, antialias, is_dotted = self._get_segment_style_from_move(move_properties_dict)
 
@@ -526,9 +536,6 @@ class Layer3DViewerDialog(QDialog):
         # Draw edit session lines (if editor active and sessions exist)
         if self.editor_active and self.edit_sessions:
             for session in self.edit_sessions:
-                # `origin_move_idx_in_items` and `current_tip_move_idx_in_items` refer to indices in `self.items`
-                # We need to map these to `self.current_display_moves` or use stored coordinates.
-                # Session stores `origin_coords_np` and `current_tip_coords_np`.
                 if session.get('origin_coords_np') is not None and session.get('current_tip_coords_np') is not None:
                     origin_np = session['origin_coords_np']
                     current_tip_np = session['current_tip_coords_np']

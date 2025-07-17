@@ -1,5 +1,5 @@
 class Move:
-    def __init__(self, x=None, y=None, z=None, e=None, move_type=None, original_line_index=None, preceding_comment=None):
+    def __init__(self, x=None, y=None, z=None, e=None, move_type=None, original_line_index=None, preceding_comment=None, original_cmd=None, params=None, original_line=None):
         self.x = x
         self.y = y
         self.z = z
@@ -7,6 +7,9 @@ class Move:
         self.type = move_type  # e.g., 'travel', 'perimeter', 'external_perimeter' or from ;TYPE comment
         self.original_line_index = original_line_index # Original index within its GCodeLayer.original_lines
         self.preceding_comment = preceding_comment # Stores the ;TYPE comment line if it directly precedes this move
+        self.original_cmd = original_cmd # G0, G1, G2, G3, etc.
+        self.params = params if params is not None else {} # Dict of all parsed parameters (X, Y, Z, E, F, I, J, R, S, etc.)
+        self.original_line = original_line # The exact original G-code line, for untouched moves
 
     def to_dict(self):
         return {
@@ -17,6 +20,9 @@ class Move:
             'type': self.type,
             'original_line_index': self.original_line_index,
             'preceding_comment': self.preceding_comment,
+            'original_cmd': self.original_cmd,
+            'params': self.params,
+            'original_line': self.original_line,
         }
 
     @staticmethod
@@ -28,7 +34,10 @@ class Move:
             e=data.get('e'),
             move_type=data.get('type'),
             original_line_index=data.get('original_line_index'),
-            preceding_comment=data.get('preceding_comment')
+            preceding_comment=data.get('preceding_comment'),
+            original_cmd=data.get('original_cmd'),
+            params=data.get('params', {}),
+            original_line=data.get('original_line'),
         )
 
 class GCodeLayer:

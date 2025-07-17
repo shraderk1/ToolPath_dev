@@ -1,4 +1,5 @@
 from gcode_models import Move, GCodeLayer
+import math
 
 class GCodeParser:
     def __init__(self):
@@ -106,15 +107,15 @@ class GCodeParser:
                 current_type_comment_line = None # Reset type comment if a non-G1/G0 command appears
                 continue
 
+
             # Attempt to parse G0, G1, G2, G3 as moves
-            # G2/G3 (arcs) are complex and will be treated as single moves from start to end point for now.
             if line_strip.startswith(('G0', 'G1', 'G00', 'G01', 'G2', 'G02', 'G3', 'G03')):
                 parts = line_strip.split()
                 cmd = parts[0].upper()
 
                 move_params = {'x': None, 'y': None, 'z': None, 'e': None, 'f': None, 'i': None, 'j': None, 'r':None, 'p':None, 's':None}
-                has_xyz_change = False # Did X, Y, or Z change in this line?
-                has_e_change = False   # Did E change in this line?
+                has_xyz_change = False
+                has_e_change = False
 
                 for part in parts[1:]:
                     if not part: continue
@@ -123,70 +124,101 @@ class GCodeParser:
                         value = float(part[1:])
                         if char == 'X': move_params['x'] = value; has_xyz_change = True
                         elif char == 'Y': move_params['y'] = value; has_xyz_change = True
-                        elif char == 'Z': move_params['z'] = value; has_xyz_change = True # Z change doesn't make it a "move" for type determination alone
+                        elif char == 'Z': move_params['z'] = value; has_xyz_change = True
                         elif char == 'E': move_params['e'] = value; has_e_change = True
                         elif char == 'F': move_params['f'] = value
-                        # For G2/G3, capture I, J, R, P, S if needed for more detailed parsing later
                         elif char == 'I': move_params['i'] = value
                         elif char == 'J': move_params['j'] = value
                         elif char == 'R': move_params['r'] = value
-                        elif char == 'P': move_params['p'] = value # G2/G3 P parameter (revolutions)
-                        elif char == 'S': move_params['s'] = value # G0 S parameter (Laser power for some firmware)
+                        elif char == 'P': move_params['p'] = value
+                        elif char == 'S': move_params['s'] = value
                     except ValueError:
-                        # Non-numeric parameter or malformed, treat line as non-move
-                        # This path should ideally not be taken for valid G-code.
-                        # For simplicity, if parsing fails, we might misclassify.
                         pass
 
                 # If it's just G0/G1 without parameters, or only F/S, it's not a spatial move.
                 if not has_xyz_change and not has_e_change and cmd in ('G0','G1','G00','G01'):
-                    gcode_layer.add_item(line_text) # Add as a string item
+                    gcode_layer.add_item(line_text)
                     current_type_comment_line = None
                     continue
 
-                # Determine current absolute coordinates for the move
-                # If a coordinate is not specified in the line, it retains its previous value.
                 current_x = move_params['x'] if move_params['x'] is not None else last_x
                 current_y = move_params['y'] if move_params['y'] is not None else last_y
                 current_z = move_params['z'] if move_params['z'] is not None else last_z
                 current_e = move_params['e'] if move_params['e'] is not None else last_e
 
-                # Determine move type (e.g., 'travel' or from ';TYPE:' comment)
-                # This logic is from the original GCodeEditor.parse_moves and Layer3DViewer.parse_moves
                 move_type_str = None
                 if current_type_comment_line:
-                    # Extract type from comment like ";TYPE:External perimeter"
-                    type_from_comment = current_type_comment_line.strip()[6:].lower() # Get "external perimeter"
+                    type_from_comment = current_type_comment_line.strip()[6:].lower()
                     move_type_str = type_from_comment
 
-                # Override with 'travel' if it's a non-extruding move (G0 or G1 with no E change or E reset)
-                # A G0 command is typically always travel, regardless of E.
-                # A G1 move is travel if E does not advance or is not present.
                 is_explicit_travel_cmd = cmd in ('G0', 'G00')
-
-                # Extrusion amount for this move. If E is specified, it's current_e - last_e.
-                # If E is not specified, extrusion_amount is 0.
                 extrusion_this_move = 0.0
-                if move_params['e'] is not None and last_e is not None: # E is specified
+                if move_params['e'] is not None and last_e is not None:
                     extrusion_this_move = current_e - last_e
-                elif move_params['e'] is not None and last_e is None: # First E value
-                    extrusion_this_move = current_e # Or treat as relative to 0 if E was reset
+                elif move_params['e'] is not None and last_e is None:
+                    extrusion_this_move = current_e
 
-                # Threshold for "significant" extrusion. Helps classify moves with tiny E changes due to float precision as travel.
-                significant_extrusion_threshold = 1e-5 # 0.00001 mm
+                significant_extrusion_threshold = 1e-5
 
                 if is_explicit_travel_cmd:
                     move_type_str = 'travel'
-                elif abs(extrusion_this_move) < significant_extrusion_threshold and has_xyz_change : # G1, E not changed much or not present, but XYZ changed
+                elif abs(extrusion_this_move) < significant_extrusion_threshold and has_xyz_change:
                     move_type_str = 'travel'
-                elif not has_e_change and last_e is None and has_xyz_change: # No E ever seen, G1 with XYZ change
+                elif not has_e_change and last_e is None and has_xyz_change:
                     move_type_str = 'travel'
 
-
-                # Create Move object
-                # A "move" for visualization typically requires X or Y to change.
-                # Z-only or E-only moves are also valid G-code but might be treated differently by visualizers.
-                if current_x is not None and current_y is not None: # Requires at least X and Y to be defined
+                # Interpolate G2/G3 arcs into a sequence of Moves for visualization
+                if cmd in ('G2', 'G02', 'G3', 'G03') and current_x is not None and current_y is not None:
+                    # Ensure previous position is valid
+                    if last_x is not None and last_y is not None:
+                        # Arc interpolation
+                        start_x = last_x
+                        start_y = last_y
+                        end_x = current_x
+                        end_y = current_y
+                        center_x = start_x + (move_params['i'] if move_params['i'] is not None else 0)
+                        center_y = start_y + (move_params['j'] if move_params['j'] is not None else 0)
+                        radius = ((start_x - center_x)**2 + (start_y - center_y)**2)**0.5
+                        start_angle = math.atan2(start_y - center_y, start_x - center_x)
+                        end_angle = math.atan2(end_y - center_y, end_x - center_x)
+                        is_cw = cmd in ('G2', 'G02')
+                        if is_cw:
+                            if end_angle > start_angle:
+                                end_angle -= 2*math.pi
+                            angle_range = start_angle - end_angle
+                        else:
+                            if end_angle < start_angle:
+                                end_angle += 2*math.pi
+                            angle_range = end_angle - start_angle
+                        num_segments = max(8, int(abs(angle_range) / (math.pi/36))) # ~5 deg per segment
+                        for seg in range(1, num_segments+1):
+                            frac = seg / num_segments
+                            if is_cw:
+                                theta = start_angle - frac * angle_range
+                            else:
+                                theta = start_angle + frac * angle_range
+                            px = center_x + radius * math.cos(theta)
+                            py = center_y + radius * math.sin(theta)
+                            pz = current_z
+                            pe = current_e
+                            move_obj = Move(
+                                x=px, y=py, z=pz, e=pe,
+                                move_type=move_type_str,
+                                original_line_index=line_idx,
+                                preceding_comment=current_type_comment_line if move_type_str and move_type_str != 'travel' else None
+                            )
+                            gcode_layer.add_item(move_obj)
+                        # Update last known position
+                        last_x = current_x
+                        last_y = current_y
+                        last_z = current_z
+                        last_e = current_e
+                        current_type_comment_line = None
+                    else:
+                        # If previous position is not valid, treat as non-move line to avoid math errors
+                        gcode_layer.add_item(line_text)
+                        current_type_comment_line = None
+                elif current_x is not None and current_y is not None:
                     move_obj = Move(
                         x=current_x, y=current_y, z=current_z, e=current_e,
                         move_type=move_type_str,
@@ -194,22 +226,17 @@ class GCodeParser:
                         preceding_comment=current_type_comment_line if move_type_str and move_type_str != 'travel' else None
                     )
                     gcode_layer.add_item(move_obj)
-
-                    # Update last known absolute coordinates for next iteration
                     if move_params['x'] is not None: last_x = current_x
                     if move_params['y'] is not None: last_y = current_y
                     if move_params['z'] is not None: last_z = current_z
                     if move_params['e'] is not None: last_e = current_e
-
-                    current_type_comment_line = None # Consume the type comment
+                    current_type_comment_line = None
                 else:
-                    # Not considered a plottable XY move (e.g., G1 Z5 only, or G1 E10 only without prior X,Y)
-                    # Add as a string item. This might need refinement.
                     gcode_layer.add_item(line_text)
                     current_type_comment_line = None
 
-            else: # Line is not a G0-G3, comment, M-code, etc. (should be rare for valid G-code)
-                gcode_layer.add_item(line_text) # Treat as a non-move line
+            else:
+                gcode_layer.add_item(line_text)
                 current_type_comment_line = None
 
         # After parsing all lines, gcode_layer.items is populated.
