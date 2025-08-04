@@ -629,13 +629,21 @@ class Layer3DViewerDialog(QDialog):
                 QMessageBox.warning(self, "Cannot Edit", "No moves loaded to edit.")
                 return
 
+            # Clamp the slider value to the number of moves (prevents slider being past last move)
+            num_moves = len(self.current_display_moves)
+            if self.current_slider_index > num_moves:
+                print(f"[DEBUG] toggle_editor_mode: Clamping slider from {self.current_slider_index} to {num_moves}")
+                self.current_slider_index = num_moves
+                self.slider.setValue(num_moves if num_moves > 0 else 1)
+
             # Debug: Print current slider and moves info
             print("[DEBUG] toggle_editor_mode: current_slider_index:", self.current_slider_index)
             print("[DEBUG] toggle_editor_mode: len(current_display_moves):", len(self.current_display_moves))
             print("[DEBUG] toggle_editor_mode: len(self.items):", len(self.items))
 
             # Determine the item index in self.items corresponding to current slider position
-            current_move_dict_idx = self.current_slider_index - 1
+            # Clamp to last valid move index if slider is at or past the end
+            current_move_dict_idx = min(self.current_slider_index - 1, len(self.current_display_moves) - 1)
             print("[DEBUG] toggle_editor_mode: current_move_dict_idx:", current_move_dict_idx)
             if not (0 <= current_move_dict_idx < len(self.current_display_moves)):
                 print("[DEBUG] toggle_editor_mode: Invalid slider position for edit.")
@@ -661,15 +669,25 @@ class Layer3DViewerDialog(QDialog):
             start_move_obj = self.items[origin_item_idx]
             print("[DEBUG] toggle_editor_mode: start_move_obj:", start_move_obj)
 
+            # Check for valid coordinates before starting session
+            if (
+                getattr(start_move_obj, 'x', None) is None or
+                getattr(start_move_obj, 'y', None) is None or
+                getattr(start_move_obj, 'z', None) is None
+            ):
+                print(f"[DEBUG] toggle_editor_mode: Invalid move coordinates at origin_item_idx {origin_item_idx}: x={getattr(start_move_obj, 'x', None)}, y={getattr(start_move_obj, 'y', None)}, z={getattr(start_move_obj, 'z', None)}")
+                QMessageBox.critical(self, "Error", "Selected move does not have valid X/Y/Z coordinates. Please select a different move.")
+                return
+
             self.dpad_widget.setVisible(True)
             self.editor_button.setText("Stop Editing Session")
             self.editor_button.setStyleSheet("background-color: red; color: white;")
             self.editor_active = True
 
             start_coords_np = np.array([
-                start_move_obj.x if start_move_obj.x is not None else 0.0,
-                start_move_obj.y if start_move_obj.y is not None else 0.0,
-                start_move_obj.z if start_move_obj.z is not None else 0.0
+                start_move_obj.x,
+                start_move_obj.y,
+                start_move_obj.z
             ])
 
             # Always create a new session, never reuse or mutate previous sessions
