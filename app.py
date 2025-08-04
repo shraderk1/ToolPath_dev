@@ -454,7 +454,7 @@ class Layer3DViewerDialog(QDialog):
         self.slider.setMaximum(num_moves if num_moves > 0 else 1)
         self.slider.setValue(self.current_slider_index if self.current_slider_index > 0 else 1)
 
-        self.edit_sessions = []
+        # Only reset editor_active and D-pad UI, do not reset edit_sessions here
         self.editor_active = False
         self.dpad_widget.setVisible(False)
         self.editor_button.setText("Enable Toolpath Editor")
@@ -539,8 +539,19 @@ class Layer3DViewerDialog(QDialog):
                 if session.get('origin_coords_np') is not None and session.get('current_tip_coords_np') is not None:
                     origin_np = session['origin_coords_np']
                     current_tip_np = session['current_tip_coords_np']
-                    if not np.allclose(origin_np, current_tip_np):
-                        seg_np = np.array([origin_np, current_tip_np])
+                    # Ensure no None values before np.allclose
+                    safe_origin_np = np.array([
+                        origin_np[0] if origin_np[0] is not None else 0.0,
+                        origin_np[1] if origin_np[1] is not None else 0.0,
+                        origin_np[2] if origin_np[2] is not None else 0.0
+                    ])
+                    safe_current_tip_np = np.array([
+                        current_tip_np[0] if current_tip_np[0] is not None else 0.0,
+                        current_tip_np[1] if current_tip_np[1] is not None else 0.0,
+                        current_tip_np[2] if current_tip_np[2] is not None else 0.0
+                    ])
+                    if not np.allclose(safe_origin_np, safe_current_tip_np):
+                        seg_np = np.array([safe_origin_np, safe_current_tip_np])
                         edit_line = gl.GLLinePlotItem(pos=seg_np, color=session['color'], width=7, antialias=True, mode='lines')
                         self.gl_widget.addItem(edit_line)
 
@@ -611,66 +622,73 @@ class Layer3DViewerDialog(QDialog):
         if val < self.slider.maximum():
             self.slider.setValue(val + 1)
 
-    def toggle_editor_mode(self): # Was toggle_editor
-        if not self.dpad_widget.isVisible(): # To enable editor
+    def toggle_editor_mode(self):
+        # Always start a new edit session from the current slider position, regardless of how many sessions exist
+        if not self.dpad_widget.isVisible():  # To enable editor
             if not self.current_display_moves:
                 QMessageBox.warning(self, "Cannot Edit", "No moves loaded to edit.")
                 return
 
-            # Determine the item index in self.items corresponding to current slider position
-            # Slider index is 1-based for current_display_moves.
-            # current_display_moves[slider_idx - 1] is the target move dict.
-            # We need to find this Move object in self.items.
+            # Debug: Print current slider and moves info
+            print("[DEBUG] toggle_editor_mode: current_slider_index:", self.current_slider_index)
+            print("[DEBUG] toggle_editor_mode: len(current_display_moves):", len(self.current_display_moves))
+            print("[DEBUG] toggle_editor_mode: len(self.items):", len(self.items))
 
-            current_move_dict_idx = self.current_slider_index -1
+            # Determine the item index in self.items corresponding to current slider position
+            current_move_dict_idx = self.current_slider_index - 1
+            print("[DEBUG] toggle_editor_mode: current_move_dict_idx:", current_move_dict_idx)
             if not (0 <= current_move_dict_idx < len(self.current_display_moves)):
+                print("[DEBUG] toggle_editor_mode: Invalid slider position for edit.")
                 QMessageBox.warning(self, "Error", "Slider position invalid for starting edit.")
                 return
 
-            target_move_dict = self.current_display_moves[current_move_dict_idx]
-
             # Find the corresponding Move object in self.items
-            # This is tricky if Move objects don't have unique IDs. Assume sequence for now.
-            # A more robust way: store (item_index, move_dict_index) map or search by coords.
-            # Simplified: assume current_move_dict_idx maps to the Nth Move object in self.items
             count_moves_in_items = 0
-            origin_item_idx = -1 # Index in self.items of the Move object we are starting from
+            origin_item_idx = -1  # Index in self.items of the Move object we are starting from
             for i, item in enumerate(self.items):
                 if isinstance(item, Move):
                     if count_moves_in_items == current_move_dict_idx:
                         origin_item_idx = i
                         break
-                    count_moves_in_items +=1
+                    count_moves_in_items += 1
 
+            print("[DEBUG] toggle_editor_mode: origin_item_idx:", origin_item_idx)
             if origin_item_idx == -1:
+                print("[DEBUG] toggle_editor_mode: Could not find starting move in self.items.")
                 QMessageBox.critical(self, "Error", "Could not find starting move in internal items list.")
                 return
+
+            start_move_obj = self.items[origin_item_idx]
+            print("[DEBUG] toggle_editor_mode: start_move_obj:", start_move_obj)
 
             self.dpad_widget.setVisible(True)
             self.editor_button.setText("Stop Editing Session")
             self.editor_button.setStyleSheet("background-color: red; color: white;")
             self.editor_active = True
 
-            start_move_obj = self.items[origin_item_idx] # Should be a Move object
-            start_coords_np = np.array([start_move_obj.x, start_move_obj.y, start_move_obj.z])
+            start_coords_np = np.array([
+                start_move_obj.x if start_move_obj.x is not None else 0.0,
+                start_move_obj.y if start_move_obj.y is not None else 0.0,
+                start_move_obj.z if start_move_obj.z is not None else 0.0
+            ])
 
+            # Always create a new session, never reuse or mutate previous sessions
             session_color = self.session_colors[len(self.edit_sessions) % len(self.session_colors)]
             new_session = {
-                'origin_item_idx_in_items': origin_item_idx, # Index in self.items of the Move we started from
-                'current_tip_item_idx_in_items': origin_item_idx, # Index in self.items of the current tip of this session's edits
+                'origin_item_idx_in_items': origin_item_idx,
+                'current_tip_item_idx_in_items': origin_item_idx,
                 'origin_coords_np': start_coords_np,
-                'current_tip_coords_np': np.copy(start_coords_np), # Initially tip is at origin
+                'current_tip_coords_np': np.copy(start_coords_np),
                 'color': session_color,
-                'dpad_deltas_this_session': [], # Store (dx,dy) of D-pad moves in this session
+                'dpad_deltas_this_session': [],
             }
             self.edit_sessions.append(new_session)
-        else: # To disable editor
+        else:  # To disable editor
             self.dpad_widget.setVisible(False)
             self.editor_button.setText("Enable Toolpath Editor")
             self.editor_button.setStyleSheet("")
             self.editor_active = False
-            # Finalize path patching if any complex logic was needed (e.g., connect back to next original move)
-            # For now, edits are directly inserted into self.items.
+            # No mutation of edit_sessions here
 
         self.update_plot_and_slider_status()
 
@@ -720,7 +738,9 @@ class Layer3DViewerDialog(QDialog):
         new_y = last_coords_np[1] + delta_xy[1]
         lift_height = 1.0
         new_z = last_coords_np[2] + lift_height
-        new_move_obj = Move(x=new_x, y=new_y, z=new_z, e=last_e_value, move_type='travel_edit', original_line_index=None)
+        # Compose a G0 travel move line for saving
+        gcode_line = f"G0 X{new_x:.3f} Y{new_y:.3f} Z{new_z:.3f}"
+        new_move_obj = Move(x=new_x, y=new_y, z=new_z, e=last_e_value, move_type='travel', original_line_index=None, original_line=gcode_line)
         insert_at_item_idx = idx_of_item_to_insert_after + 1
         self.items.insert(insert_at_item_idx, new_move_obj)
         current_session['dpad_deltas_this_session'].append(delta_xy)
@@ -728,18 +748,23 @@ class Layer3DViewerDialog(QDialog):
         current_session['current_tip_coords_np'] = np.array([new_x, new_y, new_z])
         self.current_display_moves = self._get_move_dicts_from_items()
         self.slider.setMaximum(len(self.current_display_moves) if self.current_display_moves else 1)
+        # Find the index of the new move in the filtered Move list (current_display_moves)
         newly_inserted_move_display_idx = -1
-        move_count = 0
-        for item_idx, item_val in enumerate(self.items):
-            if item_val is new_move_obj:
-                newly_inserted_move_display_idx = move_count
+        for idx, move_dict in enumerate(self.current_display_moves):
+            # Compare by object identity if possible, else fallback to coordinates
+            if (
+                hasattr(new_move_obj, 'to_dict') and move_dict == new_move_obj.to_dict()
+                and abs(move_dict.get('x', 0) - new_move_obj.x) < 1e-6
+                and abs(move_dict.get('y', 0) - new_move_obj.y) < 1e-6
+                and abs(move_dict.get('z', 0) - new_move_obj.z) < 1e-6
+            ):
+                newly_inserted_move_display_idx = idx
                 break
-            if isinstance(item_val, Move):
-                move_count += 1
         if newly_inserted_move_display_idx != -1:
             self.slider.setValue(newly_inserted_move_display_idx + 1)
         else:
-            if self.slider.value() < self.slider.maximum(): self.slider.setValue(self.slider.value()+1)
+            if self.slider.value() < self.slider.maximum():
+                self.slider.setValue(self.slider.value() + 1)
         self.update_plot_and_slider_status()
 
     def handle_dpad_move_grid(self, grid_pos):
@@ -767,6 +792,10 @@ class Layer3DViewerDialog(QDialog):
         idx_of_item_to_insert_after = current_session['current_tip_item_idx_in_items']
         if not (0 <= idx_of_item_to_insert_after < len(self.items)): return
         last_coords_np = current_session['current_tip_coords_np']
+        # Ensure coordinates are not None (default to 0.0 if so)
+        safe_x = last_coords_np[0] if last_coords_np[0] is not None else 0.0
+        safe_y = last_coords_np[1] if last_coords_np[1] is not None else 0.0
+        safe_z = last_coords_np[2] if last_coords_np[2] is not None else 0.0
         last_e_value = 0.0 # Default E
         if isinstance(self.items[idx_of_item_to_insert_after], Move):
             last_e_value = self.items[idx_of_item_to_insert_after].e or 0.0
@@ -782,17 +811,23 @@ class Layer3DViewerDialog(QDialog):
                     current_session['current_tip_item_idx_in_items'] = idx_of_item_to_insert_after -1
                     if isinstance(self.items[current_session['current_tip_item_idx_in_items']], Move):
                         prev_move_obj = self.items[current_session['current_tip_item_idx_in_items']]
-                        current_session['current_tip_coords_np'] = np.array([prev_move_obj.x, prev_move_obj.y, prev_move_obj.z])
+                        current_session['current_tip_coords_np'] = np.array([
+                            prev_move_obj.x if prev_move_obj.x is not None else 0.0,
+                            prev_move_obj.y if prev_move_obj.y is not None else 0.0,
+                            prev_move_obj.z if prev_move_obj.z is not None else 0.0
+                        ])
                     self.current_display_moves = self._get_move_dicts_from_items()
                     self.slider.setMaximum(len(self.current_display_moves) if self.current_display_moves else 1)
                     if self.slider.value() > 1 : self.slider.setValue(self.slider.value() -1)
                     self.update_plot_and_slider_status()
                     return
-        new_x = last_coords_np[0] + delta_xy[0]
-        new_y = last_coords_np[1] + delta_xy[1]
+        new_x = safe_x + delta_xy[0]
+        new_y = safe_y + delta_xy[1]
         lift_height = 1.0
-        new_z = last_coords_np[2] + lift_height
-        new_move_obj = Move(x=new_x, y=new_y, z=new_z, e=last_e_value, move_type='travel_edit', original_line_index=None)
+        new_z = safe_z + lift_height
+        # Compose a G0 travel move line for saving
+        gcode_line = f"G0 X{new_x:.3f} Y{new_y:.3f} Z{new_z:.3f}"
+        new_move_obj = Move(x=new_x, y=new_y, z=new_z, e=last_e_value, move_type='travel', original_line_index=None, original_line=gcode_line)
         insert_at_item_idx = idx_of_item_to_insert_after + 1
         self.items.insert(insert_at_item_idx, new_move_obj)
         current_session['dpad_deltas_this_session'].append(delta_xy)
@@ -800,18 +835,22 @@ class Layer3DViewerDialog(QDialog):
         current_session['current_tip_coords_np'] = np.array([new_x, new_y, new_z])
         self.current_display_moves = self._get_move_dicts_from_items()
         self.slider.setMaximum(len(self.current_display_moves) if self.current_display_moves else 1)
+        # Find the index of the new move in the filtered Move list (current_display_moves)
         newly_inserted_move_display_idx = -1
-        move_count = 0
-        for item_idx, item_val in enumerate(self.items):
-            if item_val is new_move_obj:
-                newly_inserted_move_display_idx = move_count
+        for idx, move_dict in enumerate(self.current_display_moves):
+            if (
+                hasattr(new_move_obj, 'to_dict') and move_dict == new_move_obj.to_dict()
+                and abs(move_dict.get('x', 0) - new_move_obj.x) < 1e-6
+                and abs(move_dict.get('y', 0) - new_move_obj.y) < 1e-6
+                and abs(move_dict.get('z', 0) - new_move_obj.z) < 1e-6
+            ):
+                newly_inserted_move_display_idx = idx
                 break
-            if isinstance(item_val, Move):
-                move_count += 1
         if newly_inserted_move_display_idx != -1:
             self.slider.setValue(newly_inserted_move_display_idx + 1)
         else:
-            if self.slider.value() < self.slider.maximum(): self.slider.setValue(self.slider.value()+1)
+            if self.slider.value() < self.slider.maximum():
+                self.slider.setValue(self.slider.value() + 1)
         self.update_plot_and_slider_status()
 
     def trigger_apply_edits_to_mainwin(self): # Was save_edits

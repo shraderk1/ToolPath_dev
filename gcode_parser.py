@@ -108,6 +108,7 @@ class GCodeParser:
                 continue
 
 
+
             # Attempt to parse G0, G1, G2, G3 as moves
             if line_strip.startswith(('G0', 'G1', 'G00', 'G01', 'G2', 'G02', 'G3', 'G03')):
                 parts = line_strip.split()
@@ -116,12 +117,14 @@ class GCodeParser:
                 move_params = {'x': None, 'y': None, 'z': None, 'e': None, 'f': None, 'i': None, 'j': None, 'r':None, 'p':None, 's':None}
                 has_xyz_change = False
                 has_e_change = False
+                params_dict = {}
 
                 for part in parts[1:]:
                     if not part: continue
                     char = part[0].upper()
                     try:
                         value = float(part[1:])
+                        params_dict[char] = value
                         if char == 'X': move_params['x'] = value; has_xyz_change = True
                         elif char == 'Y': move_params['y'] = value; has_xyz_change = True
                         elif char == 'Z': move_params['z'] = value; has_xyz_change = True
@@ -135,9 +138,24 @@ class GCodeParser:
                     except ValueError:
                         pass
 
+                # Always store the original line as a Move for full-fidelity output
+                move_obj_full = Move(
+                    x=move_params['x'],
+                    y=move_params['y'],
+                    z=move_params['z'],
+                    e=move_params['e'],
+                    move_type=None, # Type can be set by viewer or later logic
+                    original_line_index=line_idx,
+                    preceding_comment=current_type_comment_line,
+                    original_cmd=cmd,
+                    params=params_dict,
+                    original_line=line_text
+                )
+                gcode_layer.add_item(move_obj_full)
+
+                # --- Existing logic for visualization/interpolation below ---
                 # If it's just G0/G1 without parameters, or only F/S, it's not a spatial move.
                 if not has_xyz_change and not has_e_change and cmd in ('G0','G1','G00','G01'):
-                    gcode_layer.add_item(line_text)
                     current_type_comment_line = None
                     continue
 
@@ -167,11 +185,11 @@ class GCodeParser:
                 elif not has_e_change and last_e is None and has_xyz_change:
                     move_type_str = 'travel'
 
-                # Interpolate G2/G3 arcs into a sequence of Moves for visualization
+                # Interpolate G2/G3 arcs into a sequence of Moves for visualization only (not for saving)
                 if cmd in ('G2', 'G02', 'G3', 'G03') and current_x is not None and current_y is not None:
                     # Ensure previous position is valid
                     if last_x is not None and last_y is not None:
-                        # Arc interpolation
+                        # Arc interpolation for visualization (not for saving)
                         start_x = last_x
                         start_y = last_y
                         end_x = current_x
@@ -190,7 +208,8 @@ class GCodeParser:
                             if end_angle < start_angle:
                                 end_angle += 2*math.pi
                             angle_range = end_angle - start_angle
-                        num_segments = max(8, int(abs(angle_range) / (math.pi/36))) # ~5 deg per segment
+                        # Moderate resolution for arc interpolation: ~2 deg per segment
+                        num_segments = max(8, int(abs(angle_range) / (math.pi/90))) # ~2 deg per segment
                         for seg in range(1, num_segments+1):
                             frac = seg / num_segments
                             if is_cw:
@@ -216,7 +235,6 @@ class GCodeParser:
                         current_type_comment_line = None
                     else:
                         # If previous position is not valid, treat as non-move line to avoid math errors
-                        gcode_layer.add_item(line_text)
                         current_type_comment_line = None
                 elif current_x is not None and current_y is not None:
                     move_obj = Move(
@@ -232,8 +250,9 @@ class GCodeParser:
                     if move_params['e'] is not None: last_e = current_e
                     current_type_comment_line = None
                 else:
-                    gcode_layer.add_item(line_text)
                     current_type_comment_line = None
+
+            # (No else needed here; all cases are handled above)
 
             else:
                 gcode_layer.add_item(line_text)
@@ -252,59 +271,14 @@ class GCodeParser:
             if isinstance(item, str):
                 output_lines.append(item) # Assumes item includes newline if it's a full line
             elif isinstance(item, Move):
-                move_dict = item.to_dict() # Convert Move object to dictionary for processing
-
-                # Reconstruct the G-code line from the Move object
-                # This needs to handle whether to write X, Y, Z, E based on changes from a "previous" state.
-                # However, for saving, we usually write the explicit parameters stored in the Move object.
-                # The main complexity is the E value: only write if different from last written E.
-
-                # Prepend preceding comment if it was stored with the move and not already added as a string item.
-                # The current _parse_layer_lines_to_items adds ;TYPE as string, so this might be redundant
-                # if item.preceding_comment and item.preceding_comment not in output_lines[-1]: # Basic check
-                #    output_lines.append(item.preceding_comment)
-
-                x_str = f"X{move_dict['x']:.3f}" if move_dict['x'] is not None else ''
-                y_str = f"Y{move_dict['y']:.3f}" if move_dict['y'] is not None else ''
-                z_str = f"Z{move_dict['z']:.3f}" if move_dict['z'] is not None else ''
-                e_str = ''
-
-                # Logic for E value from original GCodeEditor.moves_to_gcode
-                if move_dict.get('type') == 'travel':
-                    # For travel moves, no E parameter is written.
-                    # The extruder holds its position from the last extrusion.
-                    # The move_dict['e'] should still reflect this logical extruder position.
-                    pass # e_str remains empty
-                else: # Non-travel (presumably extrusion)
-                    if move_dict['e'] is not None:
-                        current_move_logical_e = move_dict['e']
-                        # Write E only if it's different from the last *written* E value,
-                        # or if no E has been written yet in this sequence of moves.
-                        if last_e_val_written_to_gcode is None or \
-                           abs(current_move_logical_e - last_e_val_written_to_gcode) > 1e-5: # Use tolerance for float comparison
-                            e_str = f"E{current_move_logical_e:.5f}"
-                            last_e_val_written_to_gcode = current_move_logical_e
-                        # If E is same as last written, e_str remains empty (no redundant E parameter)
-                    # If a non-travel move has no 'e' in its dictionary (e.g., a G1 Z-only move without E change),
-                    # e_str remains empty, which is correct.
-
-                # Construct the G-code line. Assume G1 for all moves from Move objects for now.
-                # More sophisticated would be to store original command (G0/G1/G2/G3) in Move object.
-                gline_parts = ["G1"] # Default to G1
-                if x_str: gline_parts.append(x_str)
-                if y_str: gline_parts.append(y_str)
-                if z_str: gline_parts.append(z_str)
-                if e_str: gline_parts.append(e_str)
-
-                # Only add the line if it's more than just "G1" (i.e., it has parameters)
-                if len(gline_parts) > 1:
-                    output_lines.append(" ".join(gline_parts) + '\n')
-                # If the line was just "G1" but it was supposed to be an E-only move where E didn't change,
-                # it's correctly omitted. If it was a travel move with no X,Y,Z change, it's also omitted.
-            else:
-                # Unknown item type in gcode_layer.items
-                pass # Or raise error
-
+                # Only output the original G-code line for each move (skip visualization/interpolated moves)
+                if hasattr(item, 'original_line') and item.original_line:
+                    line = item.original_line
+                    if not line.endswith('\n'):
+                        line += '\n'
+                    output_lines.append(line)
+                # else: skip interpolated/visualization-only moves (do not output)
+            # else: skip unknown types
         return output_lines
 
     def _format_move_as_gcode_line(self, move_dict, last_e_written):
